@@ -421,6 +421,23 @@ async def handle_create_release(
         SentryReleaseData object containing the created release information
     """
     try:
+        # First get the organization slug by listing organizations
+        orgs_response = await http_client.get(
+            "organizations/",
+            headers={"Authorization": f"Bearer {auth_token}"}
+        )
+        
+        if orgs_response.status_code == 401:
+            raise McpError("Error: Unauthorized. Please check your MCP_SENTRY_AUTH_TOKEN token.")
+            
+        orgs_response.raise_for_status()
+        orgs_data = orgs_response.json()
+        
+        if not orgs_data:
+            raise McpError("No organizations found for this auth token")
+            
+        org_slug = orgs_data[0]["slug"]  # Use first available org
+        
         payload = {
             "version": version,
             "projects": projects,
@@ -430,7 +447,7 @@ async def handle_create_release(
             payload["refs"] = refs
             
         response = await http_client.post(
-            "releases/",
+            f"organizations/{org_slug}/releases/",
             headers={"Authorization": f"Bearer {auth_token}"},
             json=payload
         )

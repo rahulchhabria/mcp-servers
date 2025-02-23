@@ -322,9 +322,49 @@ async def handle_get_trace(
     try:
         project_id, trace_id = extract_trace_id(trace_id_or_url)
         
-        response = await http_client.get(
-            f"projects/{project_id}/events/{trace_id}/",
+        # First get the organization slug by listing organizations
+        orgs_response = await http_client.get(
+            "organizations/",
             headers={"Authorization": f"Bearer {auth_token}"}
+        )
+        
+        if orgs_response.status_code == 401:
+            raise McpError("Error: Unauthorized. Please check your MCP_SENTRY_AUTH_TOKEN token.")
+            
+        orgs_response.raise_for_status()
+        orgs_data = orgs_response.json()
+        
+        if not orgs_data:
+            raise McpError("No organizations found for this auth token")
+            
+        org_slug = orgs_data[0]["slug"]  # Use first available org
+        
+        # Get project details using org context
+        project_response = await http_client.get(
+            f"projects/{org_slug}/{project_id}/",
+            headers={"Authorization": f"Bearer {auth_token}"}
+        )
+        
+        if project_response.status_code == 401:
+            raise McpError("Error: Unauthorized. Please check your MCP_SENTRY_AUTH_TOKEN token.")
+            
+        project_response.raise_for_status()
+        
+        # Now fetch the trace data using the correct API endpoint
+        response = await http_client.get(
+            f"organizations/{org_slug}/projects/{project_id}/events/{trace_id}/",
+            headers={"Authorization": f"Bearer {auth_token}"},
+            params={
+                "type": "transaction",
+                "field": [
+                    "transaction",
+                    "timestamp",
+                    "start_timestamp",
+                    "spans",
+                    "tags",
+                    "contexts"
+                ]
+            }
         )
         
         if response.status_code == 401:
@@ -333,12 +373,24 @@ async def handle_get_trace(
         response.raise_for_status()
         trace_data = response.json()
         
+        # Calculate duration from start_timestamp and timestamp if available
+        duration = 0
+        if "start_timestamp" in trace_data and "timestamp" in trace_data:
+            try:
+                start_time = float(trace_data["start_timestamp"])
+                end_time = float(trace_data["timestamp"])
+                duration = (end_time - start_time) * 1000  # Convert to milliseconds
+            except (ValueError, TypeError):
+                duration = trace_data.get("duration", 0)
+        else:
+            duration = trace_data.get("duration", 0)
+        
         return SentryTraceData(
             trace_id=trace_id,
             transaction=trace_data.get("transaction", ""),
             project_id=project_id,
             timestamp=trace_data.get("dateCreated", ""),
-            duration=trace_data.get("duration", 0),
+            duration=duration,
             status=trace_data.get("status", "unknown"),
             spans=trace_data.get("spans", []),
             tags=trace_data.get("tags", {})
@@ -371,9 +423,39 @@ async def handle_get_replay(
     try:
         project_id, replay_id = extract_replay_id(replay_id_or_url)
         
-        response = await http_client.get(
-            f"projects/{project_id}/replays/{replay_id}/",
+        # First get the organization slug by listing organizations
+        orgs_response = await http_client.get(
+            "organizations/",
             headers={"Authorization": f"Bearer {auth_token}"}
+        )
+        
+        if orgs_response.status_code == 401:
+            raise McpError("Error: Unauthorized. Please check your MCP_SENTRY_AUTH_TOKEN token.")
+            
+        orgs_response.raise_for_status()
+        orgs_data = orgs_response.json()
+        
+        if not orgs_data:
+            raise McpError("No organizations found for this auth token")
+            
+        org_slug = orgs_data[0]["slug"]  # Use first available org
+        
+        # Get project details using org context
+        project_response = await http_client.get(
+            f"projects/{org_slug}/{project_id}/",
+            headers={"Authorization": f"Bearer {auth_token}"}
+        )
+        
+        if project_response.status_code == 401:
+            raise McpError("Error: Unauthorized. Please check your MCP_SENTRY_AUTH_TOKEN token.")
+            
+        project_response.raise_for_status()
+        
+        # Now fetch the replay data using the correct API endpoint
+        response = await http_client.get(
+            f"organizations/{org_slug}/projects/{project_id}/replays/{replay_id}/",
+            headers={"Authorization": f"Bearer {auth_token}"},
+            params={"project": project_id}
         )
         
         if response.status_code == 401:
@@ -385,7 +467,7 @@ async def handle_get_replay(
         return SentryReplayData(
             replay_id=replay_id,
             project_id=project_id,
-            timestamp=replay_data["startedAt"],
+            timestamp=replay_data.get("startedAt", ""),
             duration=replay_data.get("duration", 0),
             url=replay_data.get("url", ""),
             error_ids=replay_data.get("errorIds", []),
@@ -421,6 +503,23 @@ async def handle_create_release(
         SentryReleaseData object containing the created release information
     """
     try:
+        # First get the organization slug by listing organizations
+        orgs_response = await http_client.get(
+            "organizations/",
+            headers={"Authorization": f"Bearer {auth_token}"}
+        )
+        
+        if orgs_response.status_code == 401:
+            raise McpError("Error: Unauthorized. Please check your MCP_SENTRY_AUTH_TOKEN token.")
+            
+        orgs_response.raise_for_status()
+        orgs_data = orgs_response.json()
+        
+        if not orgs_data:
+            raise McpError("No organizations found for this auth token")
+            
+        org_slug = orgs_data[0]["slug"]  # Use first available org
+        
         payload = {
             "version": version,
             "projects": projects,
@@ -430,7 +529,7 @@ async def handle_create_release(
             payload["refs"] = refs
             
         response = await http_client.post(
-            "releases/",
+            f"organizations/{org_slug}/releases/",
             headers={"Authorization": f"Bearer {auth_token}"},
             json=payload
         )

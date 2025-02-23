@@ -54,6 +54,103 @@ Event Count: {self.count}
         return [types.TextContent(type="text", text=self.to_text())]
 
 
+@dataclass
+class SentryTransactionData:
+    transaction_id: str
+    transaction_name: str
+    project: str
+    environment: str
+    status: str
+    duration: float  # in milliseconds
+    timestamp: str
+    spans: list[dict]
+
+    def to_text(self) -> str:
+        spans_text = "\n".join(
+            f"- {span.get('op', 'unknown')}: {span.get('description', 'N/A')} "
+            f"({span.get('duration', 0):.2f}ms)"
+            for span in self.spans
+        )
+        
+        return f"""
+Sentry Transaction: {self.transaction_name}
+Transaction ID: {self.transaction_id}
+Project: {self.project}
+Environment: {self.environment}
+Status: {self.status}
+Duration: {self.duration:.2f}ms
+Timestamp: {self.timestamp}
+
+Spans:
+{spans_text}
+        """
+
+    def to_prompt_result(self) -> types.GetPromptResult:
+        return types.GetPromptResult(
+            description=f"Sentry Transaction: {self.transaction_name}",
+            messages=[
+                types.PromptMessage(
+                    role="user", content=types.TextContent(type="text", text=self.to_text())
+                )
+            ],
+        )
+
+    def to_tool_result(self) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
+        return [types.TextContent(type="text", text=self.to_text())]
+
+
+@dataclass
+class SentryReleaseData:
+    version: str
+    project: str
+    dateCreated: str
+    dateReleased: str
+    newGroups: int
+    commits: list[dict]
+    lastDeploy: dict | None
+    stats: dict
+
+    def to_text(self) -> str:
+        commits_text = "\n".join(
+            f"- {commit.get('message', 'No message')} "
+            f"(by {commit.get('author', {}).get('name', 'Unknown')})"
+            for commit in self.commits
+        )
+
+        deploy_text = ""
+        if self.lastDeploy:
+            deploy_text = f"""
+Last Deployment:
+- Environment: {self.lastDeploy.get('environment', 'Unknown')}
+- Date: {self.lastDeploy.get('dateFinished', 'Unknown')}
+- Status: {self.lastDeploy.get('status', 'Unknown')}"""
+
+        return f"""
+Sentry Release: {self.version}
+Project: {self.project}
+Created: {self.dateCreated}
+Released: {self.dateReleased}
+New Issues: {self.newGroups}
+
+Commits:
+{commits_text}
+{deploy_text}
+        """
+
+    def to_prompt_result(self) -> types.GetPromptResult:
+        return types.GetPromptResult(
+            description=f"Sentry Release: {self.version}",
+            messages=[
+                types.PromptMessage(
+                    role="user", content=types.TextContent(type="text", text=self.to_text())
+                )
+            ],
+        )
+
+    def to_tool_result(self) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
+        return [types.TextContent(type="text", text=self.to_text())]
+
+
 class SentryError(Exception):
     pass
 
@@ -188,6 +285,94 @@ async def handle_sentry_issue(
         raise McpError(f"An error occurred: {str(e)}")
 
 
+async def handle_sentry_transaction(
+    http_client: httpx.AsyncClient, 
+    auth_token: str, 
+    transaction_id: str
+) -> SentryTransactionData:
+    try:
+        response = await http_client.get(
+            f"events/{transaction_id}/",
+            headers={"Authorization": f"Bearer {auth_token}"}
+        )
+        if response.status_code == 401:
+            raise McpError(
+                "Error: Unauthorized. Please check your MCP_SENTRY_AUTH_TOKEN token."
+            )
+        response.raise_for_status()
+        transaction_data = response.json()
+
+        return SentryTransactionData(
+            transaction_id=transaction_id,
+            transaction_name=transaction_data.get("transaction", "Unknown"),
+            project=transaction_data.get("project", "Unknown"),
+            environment=transaction_data.get("environment", "Unknown"),
+            status=transaction_data.get("contexts", {}).get("trace", {}).get("status", "Unknown"),
+            duration=transaction_data.get("duration", 0),
+            timestamp=transaction_data.get("dateCreated", "Unknown"),
+            spans=transaction_data.get("spans", [])
+        )
+
+    except httpx.HTTPStatusError as e:
+        raise McpError(f"Error fetching Sentry transaction: {str(e)}")
+    except Exception as e:
+        raise McpError(f"An error occurred: {str(e)}")
+
+
+async def handle_sentry_release(
+    http_client: httpx.AsyncClient,
+    auth_token: str,
+    organization: str,
+    project: str,
+    version: str,
+) -> SentryReleaseData:
+    try:
+        # Get release details
+        response = await http_client.get(
+            f"organizations/{organization}/releases/{version}/",
+            headers={"Authorization": f"Bearer {auth_token}"}
+        )
+        if response.status_code == 401:
+            raise McpError(
+                "Error: Unauthorized. Please check your MCP_SENTRY_AUTH_TOKEN token."
+            )
+        response.raise_for_status()
+        release_data = response.json()
+
+        # Get commits for this release
+        commits_response = await http_client.get(
+            f"organizations/{organization}/releases/{version}/commits/",
+            headers={"Authorization": f"Bearer {auth_token}"}
+        )
+        commits_response.raise_for_status()
+        commits = commits_response.json()
+
+        # Get the latest deployment
+        deploys_response = await http_client.get(
+            f"organizations/{organization}/releases/{version}/deploys/",
+            headers={"Authorization": f"Bearer {auth_token}"}
+        )
+        deploys_response.raise_for_status()
+        deploys = deploys_response.json()
+        last_deploy = deploys[0] if deploys else None
+
+        return SentryReleaseData(
+            version=version,
+            project=project,
+            dateCreated=release_data.get("dateCreated", "Unknown"),
+            dateReleased=release_data.get("dateReleased", "Unknown"),
+            newGroups=release_data.get("newGroups", 0),
+            commits=commits,
+            lastDeploy=last_deploy,
+            stats=release_data.get("stats", {})
+        )
+
+    except httpx.HTTPStatusError as e:
+        raise McpError(f"Error fetching Sentry release: {str(e)}")
+    except Exception as e:
+        raise McpError(f"An error occurred: {str(e)}")
+
+
 async def serve(auth_token: str) -> Server:
     server = Server("sentry")
     http_client = httpx.AsyncClient(base_url=SENTRY_API_BASE)
@@ -205,6 +390,38 @@ async def serve(auth_token: str) -> Server:
                         required=True,
                     )
                 ],
+            ),
+            types.Prompt(
+                name="sentry-transaction",
+                description="Retrieve a Sentry transaction/trace by ID",
+                arguments=[
+                    types.PromptArgument(
+                        name="transaction_id",
+                        description="Sentry transaction ID",
+                        required=True,
+                    )
+                ],
+            ),
+            types.Prompt(
+                name="sentry-release",
+                description="Retrieve information about a Sentry release",
+                arguments=[
+                    types.PromptArgument(
+                        name="organization",
+                        description="Sentry organization slug",
+                        required=True,
+                    ),
+                    types.PromptArgument(
+                        name="project",
+                        description="Sentry project slug",
+                        required=True,
+                    ),
+                    types.PromptArgument(
+                        name="version",
+                        description="Release version",
+                        required=True,
+                    ),
+                ],
             )
         ]
 
@@ -212,12 +429,27 @@ async def serve(auth_token: str) -> Server:
     async def handle_get_prompt(
         name: str, arguments: dict[str, str] | None
     ) -> types.GetPromptResult:
-        if name != "sentry-issue":
+        if name == "sentry-issue":
+            issue_id_or_url = (arguments or {}).get("issue_id_or_url", "")
+            issue_data = await handle_sentry_issue(http_client, auth_token, issue_id_or_url)
+            return issue_data.to_prompt_result()
+        elif name == "sentry-transaction":
+            transaction_id = (arguments or {}).get("transaction_id", "")
+            transaction_data = await handle_sentry_transaction(http_client, auth_token, transaction_id)
+            return transaction_data.to_prompt_result()
+        elif name == "sentry-release":
+            if not arguments:
+                raise ValueError("Missing required arguments")
+            release_data = await handle_sentry_release(
+                http_client,
+                auth_token,
+                arguments.get("organization", ""),
+                arguments.get("project", ""),
+                arguments.get("version", "")
+            )
+            return release_data.to_prompt_result()
+        else:
             raise ValueError(f"Unknown prompt: {name}")
-
-        issue_id_or_url = (arguments or {}).get("issue_id_or_url", "")
-        issue_data = await handle_sentry_issue(http_client, auth_token, issue_id_or_url)
-        return issue_data.to_prompt_result()
 
     @server.list_tools()
     async def handle_list_tools() -> list[types.Tool]:
@@ -240,6 +472,52 @@ async def serve(auth_token: str) -> Server:
                     },
                     "required": ["issue_id_or_url"]
                 }
+            ),
+            types.Tool(
+                name="get_sentry_transaction",
+                description="""Retrieve and analyze a Sentry transaction/trace by ID. Use this tool when you need to:
+                - Investigate performance issues and slow requests
+                - Access detailed transaction traces and spans
+                - Analyze request durations and bottlenecks
+                - Review transaction status and environment details
+                - Get timing information for specific operations""",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "transaction_id": {
+                            "type": "string",
+                            "description": "Sentry transaction ID to analyze"
+                        }
+                    },
+                    "required": ["transaction_id"]
+                }
+            ),
+            types.Tool(
+                name="get_sentry_release",
+                description="""Retrieve and analyze a Sentry release. Use this tool when you need to:
+                - Track deployments and releases
+                - View commit information for releases
+                - Monitor new issues introduced in releases
+                - Check deployment status and environments
+                - Review release metrics and statistics""",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "organization": {
+                            "type": "string",
+                            "description": "Sentry organization slug"
+                        },
+                        "project": {
+                            "type": "string",
+                            "description": "Sentry project slug"
+                        },
+                        "version": {
+                            "type": "string",
+                            "description": "Release version to analyze"
+                        }
+                    },
+                    "required": ["organization", "project", "version"]
+                }
             )
         ]
 
@@ -247,14 +525,29 @@ async def serve(auth_token: str) -> Server:
     async def handle_call_tool(
         name: str, arguments: dict | None
     ) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
-        if name != "get_sentry_issue":
+        if name == "get_sentry_issue":
+            if not arguments or "issue_id_or_url" not in arguments:
+                raise ValueError("Missing issue_id_or_url argument")
+            issue_data = await handle_sentry_issue(http_client, auth_token, arguments["issue_id_or_url"])
+            return issue_data.to_tool_result()
+        elif name == "get_sentry_transaction":
+            if not arguments or "transaction_id" not in arguments:
+                raise ValueError("Missing transaction_id argument")
+            transaction_data = await handle_sentry_transaction(http_client, auth_token, arguments["transaction_id"])
+            return transaction_data.to_tool_result()
+        elif name == "get_sentry_release":
+            if not arguments:
+                raise ValueError("Missing required arguments")
+            release_data = await handle_sentry_release(
+                http_client,
+                auth_token,
+                arguments.get("organization", ""),
+                arguments.get("project", ""),
+                arguments.get("version", "")
+            )
+            return release_data.to_tool_result()
+        else:
             raise ValueError(f"Unknown tool: {name}")
-
-        if not arguments or "issue_id_or_url" not in arguments:
-            raise ValueError("Missing issue_id_or_url argument")
-
-        issue_data = await handle_sentry_issue(http_client, auth_token, arguments["issue_id_or_url"])
-        return issue_data.to_tool_result()
 
     return server
 

@@ -1,6 +1,8 @@
 import asyncio
 from dataclasses import dataclass
 from urllib.parse import urlparse
+from datetime import datetime, timedelta
+from typing import Optional
 
 import click
 import httpx
@@ -149,6 +151,85 @@ Commits:
 
     def to_tool_result(self) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
         return [types.TextContent(type="text", text=self.to_text())]
+
+
+@dataclass
+class SentryTraceSearchResult:
+    transactions: list[dict]
+    stats: dict
+    
+    def to_text(self) -> str:
+        stats_text = "\n".join(
+            f"- {metric}: {value}" 
+            for metric, value in self.stats.items()
+        )
+        
+        transactions_text = "\n".join(
+            f"- {t.get('transaction', 'Unknown')}: {t.get('duration', 0):.2f}ms "
+            f"({t.get('count', 0)} occurrences)"
+            for t in self.transactions
+        )
+        
+        return f"""
+Transaction Statistics:
+{stats_text}
+
+Top Transactions:
+{transactions_text}
+        """
+
+    def to_prompt_result(self) -> types.GetPromptResult:
+        return types.GetPromptResult(
+            description="Sentry Trace Search Results",
+            messages=[
+                types.PromptMessage(
+                    role="user", content=types.TextContent(type="text", text=self.to_text())
+                )
+            ],
+        )
+
+    def to_tool_result(self) -> list[types.TextContent]:
+        return [types.TextContent(type="text", text=self.to_text())]
+
+
+@dataclass
+class SentrySpanDetail:
+    operation: str
+    description: str
+    duration: float
+    status: str
+    trace_id: str
+    parent_span_id: Optional[str]
+    start_timestamp: str
+    tags: dict
+    data: dict
+
+    def to_text(self) -> str:
+        tags_text = "\n".join(
+            f"  {key}: {value}" 
+            for key, value in self.tags.items()
+        )
+        
+        data_text = "\n".join(
+            f"  {key}: {value}" 
+            for key, value in self.data.items()
+        )
+        
+        return f"""
+Span Operation: {self.operation}
+Description: {self.description}
+Duration: {self.duration:.2f}ms
+Status: {self.status}
+Trace ID: {self.trace_id}
+Parent Span ID: {self.parent_span_id or 'root'}
+Start Time: {self.start_timestamp}
+
+Tags:
+{tags_text}
+
+Additional Data:
+{data_text}
+        """
 
 
 class SentryError(Exception):
@@ -373,6 +454,98 @@ async def handle_sentry_release(
         raise McpError(f"An error occurred: {str(e)}")
 
 
+async def search_transactions(
+    http_client: httpx.AsyncClient,
+    auth_token: str,
+    organization: str,
+    project: str,
+    query: str = "",
+    start_time: datetime = None,
+    end_time: datetime = None,
+) -> SentryTraceSearchResult:
+    try:
+        if not start_time:
+            start_time = datetime.now() - timedelta(hours=24)
+        if not end_time:
+            end_time = datetime.now()
+
+        params = {
+            "query": query,
+            "statsPeriod": "",
+            "start": start_time.isoformat(),
+            "end": end_time.isoformat(),
+            "field": ["transaction", "duration", "count()"],
+            "sort": "-count",
+        }
+
+        response = await http_client.get(
+            f"organizations/{organization}/events/",
+            params=params,
+            headers={"Authorization": f"Bearer {auth_token}"}
+        )
+        
+        if response.status_code == 401:
+            raise McpError("Error: Unauthorized. Please check your MCP_SENTRY_AUTH_TOKEN token.")
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        # Get performance stats
+        stats_response = await http_client.get(
+            f"organizations/{organization}/stats/",
+            params={"stat": "avg", "field": ["transaction.duration", "p95()"]},
+            headers={"Authorization": f"Bearer {auth_token}"}
+        )
+        stats_response.raise_for_status()
+        stats = stats_response.json()
+
+        return SentryTraceSearchResult(
+            transactions=data,
+            stats=stats
+        )
+
+    except httpx.HTTPStatusError as e:
+        raise McpError(f"Error searching transactions: {str(e)}")
+    except Exception as e:
+        raise McpError(f"An error occurred: {str(e)}")
+
+
+async def get_span_details(
+    http_client: httpx.AsyncClient,
+    auth_token: str,
+    span_id: str,
+    trace_id: str
+) -> SentrySpanDetail:
+    try:
+        response = await http_client.get(
+            f"events/{trace_id}/spans/{span_id}/",
+            headers={"Authorization": f"Bearer {auth_token}"}
+        )
+        
+        if response.status_code == 401:
+            raise McpError("Error: Unauthorized. Please check your MCP_SENTRY_AUTH_TOKEN token.")
+        response.raise_for_status()
+        
+        span_data = response.json()
+        
+        return SentrySpanDetail(
+            operation=span_data.get("op", "unknown"),
+            description=span_data.get("description", ""),
+            duration=span_data.get("duration", 0),
+            status=span_data.get("status", "unknown"),
+            trace_id=trace_id,
+            parent_span_id=span_data.get("parent_span_id"),
+            start_timestamp=span_data.get("start_timestamp"),
+            tags=span_data.get("tags", {}),
+            data=span_data.get("data", {})
+        )
+
+    except httpx.HTTPStatusError as e:
+        raise McpError(f"Error fetching span details: {str(e)}")
+    except Exception as e:
+        raise McpError(f"An error occurred: {str(e)}")
+
+
 async def serve(auth_token: str) -> Server:
     server = Server("sentry")
     http_client = httpx.AsyncClient(base_url=SENTRY_API_BASE)
@@ -422,7 +595,44 @@ async def serve(auth_token: str) -> Server:
                         required=True,
                     ),
                 ],
-            )
+            ),
+            types.Prompt(
+                name="search-transactions",
+                description="Search and analyze Sentry transactions",
+                arguments=[
+                    types.PromptArgument(
+                        name="organization",
+                        description="Sentry organization slug",
+                        required=True,
+                    ),
+                    types.PromptArgument(
+                        name="project",
+                        description="Sentry project slug",
+                        required=True,
+                    ),
+                    types.PromptArgument(
+                        name="query",
+                        description="Search query for transactions",
+                        required=False,
+                    ),
+                ],
+            ),
+            types.Prompt(
+                name="span-details",
+                description="Get detailed information about a specific span",
+                arguments=[
+                    types.PromptArgument(
+                        name="span_id",
+                        description="Sentry span ID",
+                        required=True,
+                    ),
+                    types.PromptArgument(
+                        name="trace_id",
+                        description="Sentry trace ID",
+                        required=True,
+                    ),
+                ],
+            ),
         ]
 
     @server.get_prompt()
@@ -448,6 +658,35 @@ async def serve(auth_token: str) -> Server:
                 arguments.get("version", "")
             )
             return release_data.to_prompt_result()
+        elif name == "search-transactions":
+            if not arguments:
+                raise ValueError("Missing required arguments")
+            search_results = await search_transactions(
+                http_client,
+                auth_token,
+                arguments.get("organization", ""),
+                arguments.get("project", ""),
+                arguments.get("query", ""),
+            )
+            return search_results.to_prompt_result()
+        elif name == "span-details":
+            if not arguments:
+                raise ValueError("Missing required arguments")
+            span_data = await get_span_details(
+                http_client,
+                auth_token,
+                arguments.get("span_id", ""),
+                arguments.get("trace_id", ""),
+            )
+            return types.GetPromptResult(
+                description=f"Span Details: {span_data.operation}",
+                messages=[
+                    types.PromptMessage(
+                        role="user",
+                        content=types.TextContent(type="text", text=span_data.to_text()),
+                    )
+                ],
+            )
         else:
             raise ValueError(f"Unknown prompt: {name}")
 
@@ -518,6 +757,56 @@ async def serve(auth_token: str) -> Server:
                     },
                     "required": ["organization", "project", "version"]
                 }
+            ),
+            types.Tool(
+                name="search_transactions",
+                description="""Search and analyze Sentry transactions. Use this tool when you need to:
+                - Find slow transactions
+                - Analyze transaction patterns
+                - Get performance statistics
+                - Compare transaction durations
+                - Identify frequent transactions""",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "organization": {
+                            "type": "string",
+                            "description": "Sentry organization slug"
+                        },
+                        "project": {
+                            "type": "string",
+                            "description": "Sentry project slug"
+                        },
+                        "query": {
+                            "type": "string",
+                            "description": "Search query for transactions"
+                        }
+                    },
+                    "required": ["organization", "project"]
+                }
+            ),
+            types.Tool(
+                name="get_span_details",
+                description="""Get detailed information about a specific span. Use this tool when you need to:
+                - Analyze specific operations within a trace
+                - Debug slow spans
+                - View span metadata and tags
+                - Understand span relationships
+                - Get detailed timing information""",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "span_id": {
+                            "type": "string",
+                            "description": "Sentry span ID"
+                        },
+                        "trace_id": {
+                            "type": "string",
+                            "description": "Sentry trace ID"
+                        }
+                    },
+                    "required": ["span_id", "trace_id"]
+                }
             )
         ]
 
@@ -546,6 +835,27 @@ async def serve(auth_token: str) -> Server:
                 arguments.get("version", "")
             )
             return release_data.to_tool_result()
+        elif name == "search_transactions":
+            if not arguments:
+                raise ValueError("Missing required arguments")
+            search_results = await search_transactions(
+                http_client,
+                auth_token,
+                arguments.get("organization", ""),
+                arguments.get("project", ""),
+                arguments.get("query", ""),
+            )
+            return search_results.to_tool_result()
+        elif name == "get_span_details":
+            if not arguments:
+                raise ValueError("Missing required arguments")
+            span_data = await get_span_details(
+                http_client,
+                auth_token,
+                arguments.get("span_id", ""),
+                arguments.get("trace_id", ""),
+            )
+            return [types.TextContent(type="text", text=span_data.to_text())]
         else:
             raise ValueError(f"Unknown tool: {name}")
 

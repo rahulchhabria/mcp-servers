@@ -17,6 +17,25 @@ MISSING_AUTH_TOKEN_MESSAGE = (
 
 
 @dataclass
+class SentryReleaseData:
+    version: str
+    url: str
+    projects: list[str]
+    dateCreated: str
+    
+    def to_text(self) -> str:
+        return f"""
+Sentry Release Created:
+Version: {self.version}
+URL: {self.url}
+Projects: {', '.join(self.projects)}
+Date Created: {self.dateCreated}
+        """
+    
+    def to_tool_result(self) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
+        return [types.TextContent(type="text", text=self.to_text())]
+
+@dataclass
 class SentryIssueData:
     title: str
     issue_id: str
@@ -139,6 +158,59 @@ def create_stacktrace(latest_event: dict) -> str:
     return "\n".join(stacktraces) if stacktraces else "No stacktrace found"
 
 
+async def handle_create_release(
+    http_client: httpx.AsyncClient,
+    auth_token: str,
+    version: str,
+    projects: list[str],
+    refs: list[dict] | None = None,
+) -> SentryReleaseData:
+    """
+    Creates a new release in Sentry.
+    
+    Args:
+        http_client: The HTTP client to use
+        auth_token: Sentry authentication token
+        version: The version identifier for the release
+        projects: List of project slugs to associate the release with
+        refs: Optional list of repository references
+        
+    Returns:
+        SentryReleaseData object containing the created release information
+    """
+    try:
+        payload = {
+            "version": version,
+            "projects": projects,
+        }
+        
+        if refs:
+            payload["refs"] = refs
+            
+        response = await http_client.post(
+            "releases/",
+            headers={"Authorization": f"Bearer {auth_token}"},
+            json=payload
+        )
+        
+        if response.status_code == 401:
+            raise McpError("Error: Unauthorized. Please check your MCP_SENTRY_AUTH_TOKEN token.")
+            
+        response.raise_for_status()
+        release_data = response.json()
+        
+        return SentryReleaseData(
+            version=release_data["version"],
+            url=release_data.get("url", ""),
+            projects=release_data["projects"],
+            dateCreated=release_data["dateCreated"]
+        )
+        
+    except httpx.HTTPStatusError as e:
+        raise McpError(f"Error creating Sentry release: {str(e)}")
+    except Exception as e:
+        raise McpError(f"An error occurred: {str(e)}")
+
 async def handle_sentry_issue(
     http_client: httpx.AsyncClient, auth_token: str, issue_id_or_url: str
 ) -> SentryIssueData:
@@ -240,6 +312,49 @@ async def serve(auth_token: str) -> Server:
                     },
                     "required": ["issue_id_or_url"]
                 }
+            ),
+            types.Tool(
+                name="create_release",
+                description="""Create a new release in Sentry. Use this tool when you need to:
+                - Create a new release for deployment tracking
+                - Associate commits with a release
+                - Track release adoption and stability
+                - Monitor release health metrics""",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "version": {
+                            "type": "string",
+                            "description": "Unique identifier for the release (e.g. commit hash, version number)"
+                        },
+                        "projects": {
+                            "type": "array",
+                            "items": {
+                                "type": "string"
+                            },
+                            "description": "List of project slugs to associate the release with"
+                        },
+                        "refs": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "repository": {
+                                        "type": "string"
+                                    },
+                                    "commit": {
+                                        "type": "string"
+                                    },
+                                    "previousCommit": {
+                                        "type": "string"
+                                    }
+                                }
+                            },
+                            "description": "Optional list of repository references"
+                        }
+                    },
+                    "required": ["version", "projects"]
+                }
             )
         ]
 
@@ -247,14 +362,28 @@ async def serve(auth_token: str) -> Server:
     async def handle_call_tool(
         name: str, arguments: dict | None
     ) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
-        if name != "get_sentry_issue":
-            raise ValueError(f"Unknown tool: {name}")
-
-        if not arguments or "issue_id_or_url" not in arguments:
-            raise ValueError("Missing issue_id_or_url argument")
-
-        issue_data = await handle_sentry_issue(http_client, auth_token, arguments["issue_id_or_url"])
-        return issue_data.to_tool_result()
+        if not arguments:
+            raise ValueError("Missing arguments")
+            
+        if name == "get_sentry_issue":
+            if "issue_id_or_url" not in arguments:
+                raise ValueError("Missing issue_id_or_url argument")
+            issue_data = await handle_sentry_issue(http_client, auth_token, arguments["issue_id_or_url"])
+            return issue_data.to_tool_result()
+            
+        elif name == "create_release":
+            if "version" not in arguments or "projects" not in arguments:
+                raise ValueError("Missing required arguments: version and projects")
+            release_data = await handle_create_release(
+                http_client,
+                auth_token,
+                arguments["version"],
+                arguments["projects"],
+                arguments.get("refs")
+            )
+            return release_data.to_tool_result()
+            
+        raise ValueError(f"Unknown tool: {name}")
 
     return server
 

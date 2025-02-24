@@ -196,14 +196,20 @@ def extract_replay_id(replay_id_or_url: str) -> tuple[str, str]:
         if not parsed_url.hostname or not parsed_url.hostname.endswith(".sentry.io"):
             raise SentryError("Invalid Sentry URL. Must be a URL ending with .sentry.io")
 
+        # Extract replay ID from path
         path_parts = parsed_url.path.strip("/").split("/")
-        if len(path_parts) < 4 or path_parts[-2] != "replays":
+        if len(path_parts) < 2 or path_parts[0] != "replays":
             raise SentryError(
-                "Invalid Sentry replay URL. Path must contain '/projects/{org}/{project}/replays/{replay_id}'"
+                "Invalid Sentry replay URL. Path must contain '/replays/{replay_id}'"
             )
+        replay_id = path_parts[1]
 
-        project_id = path_parts[-3]
-        replay_id = path_parts[-1]
+        # Extract project ID from query parameters
+        query_params = dict(param.split('=') for param in parsed_url.query.split('&') if '=' in param)
+        project_id = query_params.get('project')
+        if not project_id:
+            raise SentryError("Missing project ID in replay URL query parameters")
+
     else:
         # Expect format: project_id:replay_id
         try:
@@ -322,13 +328,36 @@ async def handle_get_trace(
     try:
         project_id, trace_id = extract_trace_id(trace_id_or_url)
         
-        response = await http_client.get(
-            f"projects/{project_id}/events/{trace_id}/",
+        # First get the organization slug by listing organizations
+        orgs_response = await http_client.get(
+            "organizations/",
             headers={"Authorization": f"Bearer {auth_token}"}
+        )
+        
+        if orgs_response.status_code == 401:
+            raise McpError("Error: Unauthorized. Please check your MCP_SENTRY_AUTH_TOKEN token.")
+            
+        orgs_response.raise_for_status()
+        orgs_data = orgs_response.json()
+        
+        if not orgs_data:
+            raise McpError("No organizations found for this auth token")
+            
+        org_slug = orgs_data[0]["slug"]  # Use first available org
+        
+        # Use the correct API endpoint format for traces
+        response = await http_client.get(
+            f"organizations/{org_slug}/events/{trace_id}/",
+            headers={"Authorization": f"Bearer {auth_token}"},
+            params={
+                "project": project_id
+            }
         )
         
         if response.status_code == 401:
             raise McpError("Error: Unauthorized. Please check your MCP_SENTRY_AUTH_TOKEN token.")
+        elif response.status_code == 404:
+            raise McpError("Trace not found. It may have been deleted or you may not have permission to access it.")
             
         response.raise_for_status()
         trace_data = response.json()
@@ -371,13 +400,37 @@ async def handle_get_replay(
     try:
         project_id, replay_id = extract_replay_id(replay_id_or_url)
         
-        response = await http_client.get(
-            f"projects/{project_id}/replays/{replay_id}/",
+        # First get the organization slug by listing organizations
+        orgs_response = await http_client.get(
+            "organizations/",
             headers={"Authorization": f"Bearer {auth_token}"}
+        )
+        
+        if orgs_response.status_code == 401:
+            raise McpError("Error: Unauthorized. Please check your MCP_SENTRY_AUTH_TOKEN token.")
+            
+        orgs_response.raise_for_status()
+        orgs_data = orgs_response.json()
+        
+        if not orgs_data:
+            raise McpError("No organizations found for this auth token")
+            
+        org_slug = orgs_data[0]["slug"]  # Use first available org
+        
+        # Use the correct API endpoint format for session replays
+        response = await http_client.get(
+            f"organizations/{org_slug}/sessions/{replay_id}/",
+            headers={"Authorization": f"Bearer {auth_token}"},
+            params={
+                "project": project_id,
+                "detailed": "1"  # Get detailed replay information
+            }
         )
         
         if response.status_code == 401:
             raise McpError("Error: Unauthorized. Please check your MCP_SENTRY_AUTH_TOKEN token.")
+        elif response.status_code == 404:
+            raise McpError("Replay not found. It may have been deleted or you may not have permission to access it.")
             
         response.raise_for_status()
         replay_data = response.json()
@@ -385,7 +438,7 @@ async def handle_get_replay(
         return SentryReplayData(
             replay_id=replay_id,
             project_id=project_id,
-            timestamp=replay_data["startedAt"],
+            timestamp=replay_data.get("startedAt", replay_data.get("timestamp", "")),
             duration=replay_data.get("duration", 0),
             url=replay_data.get("url", ""),
             error_ids=replay_data.get("errorIds", []),

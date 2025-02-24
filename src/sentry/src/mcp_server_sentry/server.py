@@ -1086,7 +1086,7 @@ def _is_valid_org_slug(slug: str) -> bool:
     import re
     if not slug or len(slug) > 64:
         return False
-    return bool(re.match(r'^[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?$', slug))
+    return bool(re.match(r'^[a-zA-Z0-9][-a-zA-Z0-9]*[a-zA-Z0-9]$', slug))
 
 def _is_valid_item_id(item_id: str, url_type: SentryUrlType) -> bool:
     """

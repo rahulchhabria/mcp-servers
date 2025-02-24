@@ -158,17 +158,42 @@ class SentryIssueData:
     last_seen: str
     count: int
     stacktrace: str
+    # New fields
+    culprit: str
+    platform: str | None
+    project_name: str | None
+    project_slug: str | None
+    priority: str | None
+    user_count: int
+    tags: list[dict]
+    stats: dict
 
     def to_text(self) -> str:
+        # Format tags as a string
+        tags_text = "\n".join([
+            f"  {tag['key']}: {tag['name']} ({tag['totalValues']} values)"
+            for tag in self.tags
+        ]) if self.tags else "  No tags"
+
         return f"""
 Sentry Issue: {self.title}
 Issue ID: {self.issue_id}
+Project: {self.project_name or 'Unknown'} ({self.project_slug or 'Unknown'})
 Status: {self.status}
 Level: {self.level}
+Priority: {self.priority or 'Not set'}
+Platform: {self.platform or 'Unknown'}
+Culprit: {self.culprit}
+
 First Seen: {self.first_seen}
 Last Seen: {self.last_seen}
 Event Count: {self.count}
+Affected Users: {self.user_count}
 
+Tags:
+{tags_text}
+
+Stacktrace:
 {self.stacktrace}
         """
 
@@ -629,17 +654,38 @@ async def handle_sentry_issue(
     try:
         issue_id = extract_issue_id(issue_id_or_url)
 
-        response = await http_client.get(
-            f"issues/{issue_id}/", headers={"Authorization": f"Bearer {auth_token}"}
+        # First get the organization slug by listing organizations
+        orgs_response = await http_client.get(
+            "organizations/",
+            headers={"Authorization": f"Bearer {auth_token}"}
         )
+        
+        if orgs_response.status_code == 401:
+            raise McpError("Error: Unauthorized. Please check your MCP_SENTRY_AUTH_TOKEN token.")
+            
+        orgs_response.raise_for_status()
+        orgs_data = orgs_response.json()
+        
+        if not orgs_data:
+            raise McpError("No organizations found for this auth token")
+            
+        org_slug = orgs_data[0]["slug"]  # Use first available org
+
+        # Get issue details using org context
+        response = await http_client.get(
+            f"organizations/{org_slug}/issues/{issue_id}/",
+            headers={"Authorization": f"Bearer {auth_token}"}
+        )
+        
         if response.status_code == 401:
-            raise McpError(
-                "Error: Unauthorized. Please check your MCP_SENTRY_AUTH_TOKEN token."
-            )
+            raise McpError("Error: Unauthorized. Please check your MCP_SENTRY_AUTH_TOKEN token.")
+        elif response.status_code == 404:
+            raise McpError("Issue not found. It may have been deleted or you may not have permission to access it.")
+            
         response.raise_for_status()
         issue_data = response.json()
 
-        # Get issue hashes
+        # Get issue hashes for stacktrace
         hashes_response = await http_client.get(
             f"issues/{issue_id}/hashes/",
             headers={"Authorization": f"Bearer {auth_token}"},
@@ -647,11 +693,10 @@ async def handle_sentry_issue(
         hashes_response.raise_for_status()
         hashes = hashes_response.json()
 
-        if not hashes:
-            raise McpError("No Sentry events found for this issue")
-
-        latest_event = hashes[0]["latestEvent"]
-        stacktrace = create_stacktrace(latest_event)
+        stacktrace = "No stacktrace available"
+        if hashes:
+            latest_event = hashes[0]["latestEvent"]
+            stacktrace = create_stacktrace(latest_event)
 
         return SentryIssueData(
             title=issue_data["title"],
@@ -660,8 +705,17 @@ async def handle_sentry_issue(
             level=issue_data["level"],
             first_seen=issue_data["firstSeen"],
             last_seen=issue_data["lastSeen"],
-            count=issue_data["count"],
-            stacktrace=stacktrace
+            count=int(issue_data["count"]),
+            stacktrace=stacktrace,
+            # New fields
+            culprit=issue_data.get("culprit", "Unknown"),
+            platform=issue_data.get("platform"),
+            project_name=issue_data.get("project", {}).get("name"),
+            project_slug=issue_data.get("project", {}).get("slug"),
+            priority=issue_data.get("priority"),
+            user_count=issue_data.get("userCount", 0),
+            tags=issue_data.get("tags", []),
+            stats=issue_data.get("stats", {})
         )
 
     except SentryError as e:

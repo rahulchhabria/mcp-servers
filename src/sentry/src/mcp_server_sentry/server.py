@@ -1145,34 +1145,59 @@ def extract_replay_id(replay_id_or_url: str) -> tuple[str, str]:
         return org_slug, replay_id
 
 
-def extract_trace_id(trace_id_or_url: str) -> tuple[str, str]:
+def extract_trace_id(trace_id_or_url: str) -> tuple[str, str, str]:
     """
-    Extracts the Sentry trace ID and organization slug from either a full URL or standalone IDs.
+    Extracts the Sentry trace ID, project ID, and organization slug from either a full URL or standalone IDs.
     
     Args:
-        trace_id_or_url: Either a full Sentry trace URL or "org_slug:trace_id" format
+        trace_id_or_url: Either a full Sentry trace URL or "org_slug:project_id:trace_id" format
         
     Returns:
-        Tuple of (org_slug, trace_id)
-        
-    Raises:
-        SentryError: If format is invalid
+        Tuple of (org_slug, project_id, trace_id)
     """
     if not trace_id_or_url:
         raise SentryError("Missing trace_id_or_url argument")
 
     if trace_id_or_url.startswith(("http://", "https://")):
-        parsed = parse_sentry_url(trace_id_or_url, "traces")
-        return parsed.org_slug, parsed.item_id
+        parsed_url = urlparse(trace_id_or_url)
+        if not parsed_url.hostname or not parsed_url.hostname.endswith(".sentry.io"):
+            raise SentryError("Invalid Sentry URL. Must be a URL ending with .sentry.io")
+
+        # Extract organization slug from hostname, preserving hyphens
+        org_slug = parsed_url.hostname.split('.')[0]
+        if not org_slug:
+            raise SentryError("Missing organization slug in hostname")
+
+        # Extract trace ID from path
+        path_parts = parsed_url.path.strip("/").split("/")
+        if len(path_parts) < 2 or path_parts[0] != "performance":
+            raise SentryError(
+                "Invalid Sentry trace URL. Path must contain '/performance/{trace_id}'"
+            )
+        trace_id = path_parts[1].rstrip("/")
+
+        # Parse query parameters
+        from urllib.parse import parse_qs
+        query_params = parse_qs(parsed_url.query)
+        
+        # Get project ID from query parameters
+        project_id = query_params.get('project', [None])[0]
+        if not project_id:
+            raise SentryError("Missing project ID in trace URL query parameters")
+
     else:
-        # Expect format: org_slug:trace_id
+        # Expect format: org_slug:project_id:trace_id
         try:
-            org_slug, trace_id = trace_id_or_url.split(":")
+            parts = trace_id_or_url.split(":")
+            if len(parts) != 3:
+                raise ValueError("Expected format: org_slug:project_id:trace_id")
+            org_slug, project_id, trace_id = parts
         except ValueError:
             raise SentryError(
-                "Invalid trace ID format. Must be either a URL or 'org_slug:trace_id'"
+                "Invalid trace ID format. Must be either a URL or 'org_slug:project_id:trace_id'"
             )
-        return org_slug, trace_id
+
+    return org_slug, project_id, trace_id
 
 
 def create_stacktrace(latest_event: dict) -> str:
@@ -1235,28 +1260,21 @@ async def handle_get_trace(
     Args:
         http_client: The HTTP client to use
         auth_token: Sentry authentication token
-        trace_id_or_url: Either a full Sentry trace URL or "org_slug:trace_id" format
+        trace_id_or_url: Either a full Sentry trace URL or "org_slug:project_id:trace_id" format
         
     Returns:
         SentryTraceData object containing the trace information
     """
     try:
-        # Get org_slug and trace_id, preserving any hyphens in org_slug
-        org_slug, trace_id = extract_trace_id(trace_id_or_url)
-        logger.debug(f"[Trace] Using organization slug: {org_slug} for trace ID: {trace_id}")
+        org_slug, project_id, trace_id = extract_trace_id(trace_id_or_url)
+        logger.debug(f"[Trace] Using organization slug: {org_slug} for trace ID: {trace_id} and project ID: {project_id}")
         
-        # Construct API URL
-        api_url = f"organizations/{org_slug}/events/{trace_id}/"
-        logger.debug(f"[Trace] Making request to: {SENTRY_API_BASE}{api_url}")
-        
-        # Fetch the trace data using the organization endpoint
+        # Use the correct API endpoint format for traces with required fields
         response = await http_client.get(
-            api_url,
-            headers={
-                "Authorization": f"Bearer {auth_token}",
-                "Content-Type": "application/json",
-            },
+            f"organizations/{org_slug}/events/{trace_id}/",
+            headers={"Authorization": f"Bearer {auth_token}"},
             params={
+                "project": project_id,
                 "type": "transaction",
                 "field": [
                     "transaction",
@@ -1264,30 +1282,25 @@ async def handle_get_trace(
                     "start_timestamp",
                     "spans",
                     "tags",
-                    "contexts"
+                    "contexts",
+                    "trace",
+                    "duration",
+                    "status"
                 ]
             }
         )
         
-        # Log full response details
-        log_response(response, "[Trace]")
-        
         if response.status_code == 401:
-            logger.error("[Trace] Authentication failed with 401 status code")
             raise McpError("Error: Unauthorized. Please check your MCP_SENTRY_AUTH_TOKEN token.")
         elif response.status_code == 404:
-            logger.error("[Trace] Resource not found with 404 status code")
             raise McpError("Trace not found. It may have been deleted or you may not have permission to access it.")
             
         response.raise_for_status()
         trace_data = response.json()
         
         if not trace_data:
-            logger.error("[Trace] Received empty response from Sentry API")
             raise McpError("Received empty response from Sentry API")
             
-        logger.debug(f"[Trace] Successfully parsed trace data with keys: {list(trace_data.keys())}")
-        
         # Calculate duration from start_timestamp and timestamp if available
         duration = 0
         if "start_timestamp" in trace_data and "timestamp" in trace_data:
@@ -1295,37 +1308,27 @@ async def handle_get_trace(
                 start_time = float(trace_data["start_timestamp"])
                 end_time = float(trace_data["timestamp"])
                 duration = (end_time - start_time) * 1000  # Convert to milliseconds
-                logger.debug(f"[Trace] Calculated duration: {duration}ms from timestamps")
-            except (ValueError, TypeError) as e:
-                logger.warning(f"[Trace] Failed to calculate duration from timestamps: {str(e)}")
+            except (ValueError, TypeError):
                 duration = trace_data.get("duration", 0)
         else:
-            logger.debug("[Trace] Using duration directly from trace data")
             duration = trace_data.get("duration", 0)
         
-        # Create SentryTraceData object
-        trace_obj = SentryTraceData(
+        return SentryTraceData(
             trace_id=trace_id,
             transaction=trace_data.get("transaction", ""),
-            project_id=trace_data.get("project_id", ""),
-            timestamp=trace_data.get("dateCreated", ""),
+            project_id=project_id,
+            timestamp=trace_data.get("timestamp", ""),
             duration=duration,
             status=trace_data.get("status", "unknown"),
             spans=trace_data.get("spans", []),
             tags=trace_data.get("tags", {})
         )
         
-        logger.debug("[Trace] Successfully created SentryTraceData object")
-        return trace_obj
-        
     except SentryError as e:
-        logger.error(f"[Trace] SentryError occurred: {str(e)}")
         raise McpError(str(e))
     except httpx.HTTPStatusError as e:
-        logger.error(f"[Trace] HTTP error occurred: {str(e)}")
         raise McpError(f"Error fetching Sentry trace: {str(e)}")
     except Exception as e:
-        logger.error(f"[Trace] Unexpected error occurred: {str(e)}")
         raise McpError(f"An error occurred: {str(e)}")
 
 

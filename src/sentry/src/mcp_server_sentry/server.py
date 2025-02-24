@@ -1,6 +1,8 @@
 import asyncio
 from dataclasses import dataclass
 from urllib.parse import urlparse
+import logging
+import json
 
 import click
 import httpx
@@ -14,6 +16,34 @@ SENTRY_API_BASE = "https://sentry.io/api/0/"
 MISSING_AUTH_TOKEN_MESSAGE = (
     """Sentry authentication token not found. Please specify your Sentry auth token."""
 )
+
+# Set up logging
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
+# Create console handler with formatting
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.DEBUG)
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+console_handler.setFormatter(formatter)
+logger.addHandler(console_handler)
+
+def log_response(response: httpx.Response, context: str = ""):
+    """Helper function to log API response details"""
+    try:
+        logger.debug(f"{context} API Request URL: {response.request.url}")
+        logger.debug(f"{context} API Request Headers: {response.request.headers}")
+        logger.debug(f"{context} API Response Status: {response.status_code}")
+        logger.debug(f"{context} API Response Headers: {response.headers}")
+        
+        # Try to parse and log response content
+        try:
+            content = response.json()
+            logger.debug(f"{context} API Response Content: {json.dumps(content, indent=2)}")
+        except json.JSONDecodeError:
+            logger.debug(f"{context} API Response Content (raw): {response.text}")
+    except Exception as e:
+        logger.error(f"Error logging response: {str(e)}")
 
 
 @dataclass
@@ -237,7 +267,7 @@ def parse_sentry_url(url: str, expected_path_type: str) -> tuple[str, str]:
     Parses a Sentry URL to extract organization slug and ID.
     
     Args:
-        url: Full Sentry URL
+        url: Full Sentry URL (e.g., https://rc-sentry-projects.sentry.io/replays/278eb868cf4f4527a7e6e39b0d116a66/)
         expected_path_type: The expected path component ('issues', 'replays', or 'traces')
         
     Returns:
@@ -246,26 +276,47 @@ def parse_sentry_url(url: str, expected_path_type: str) -> tuple[str, str]:
     Raises:
         SentryError: If URL format is invalid
     """
-    parsed_url = urlparse(url)
-    if not parsed_url.hostname or not parsed_url.hostname.endswith(".sentry.io"):
-        raise SentryError("Invalid Sentry URL. Must be a URL ending with .sentry.io")
+    try:
+        parsed_url = urlparse(url)
+        if not parsed_url.hostname or not parsed_url.hostname.endswith(".sentry.io"):
+            raise SentryError("Invalid Sentry URL. Must be a URL ending with .sentry.io")
 
-    # Extract org slug from hostname (e.g., "buildwithcode.sentry.io")
-    org_slug = parsed_url.hostname.split('.')[0]
-    
-    path_parts = parsed_url.path.strip("/").split("/")
-    
-    # Handle special case for traces which have an extra 'trace' component
-    if expected_path_type == 'traces':
-        if len(path_parts) < 3 or path_parts[0] != 'traces' or path_parts[1] != 'trace':
-            raise SentryError(f"Invalid Sentry {expected_path_type} URL. Path must contain '/traces/trace/{{id}}'")
-        item_id = path_parts[2].rstrip('/')
-    else:
-        if len(path_parts) < 2 or path_parts[0] != expected_path_type:
-            raise SentryError(f"Invalid Sentry {expected_path_type} URL. Path must contain '/{expected_path_type}/{{id}}'")
-        item_id = path_parts[1].rstrip('/')
-    
-    return org_slug, item_id
+        # Extract org slug from hostname, preserving any hyphens
+        # For hostname like "rc-sentry-projects.sentry.io", get "rc-sentry-projects"
+        hostname_parts = parsed_url.hostname.split('.')
+        if len(hostname_parts) < 2:
+            raise SentryError("Invalid Sentry URL format: hostname must contain at least two parts")
+            
+        org_slug = hostname_parts[0]
+        logger.debug(f"Extracted organization slug: {org_slug} from hostname: {parsed_url.hostname}")
+        
+        # Split path and remove empty strings and query parameters
+        path_parts = [p for p in parsed_url.path.split("/") if p]
+        logger.debug(f"Path parts after splitting: {path_parts}")
+        
+        # Handle special case for traces which have an extra 'trace' component
+        if expected_path_type == 'traces':
+            if len(path_parts) < 3 or path_parts[0] != 'traces' or path_parts[1] != 'trace':
+                raise SentryError(f"Invalid Sentry {expected_path_type} URL. Path must contain '/traces/trace/{{id}}'")
+            item_id = path_parts[2]
+            logger.debug(f"Extracted trace ID: {item_id} from path parts: {path_parts}")
+        else:
+            if len(path_parts) < 2 or path_parts[0] != expected_path_type:
+                raise SentryError(f"Invalid Sentry {expected_path_type} URL. Path must contain '/{expected_path_type}/{{id}}'")
+            # Take the ID part and remove any trailing characters after potential query params
+            item_id = path_parts[1].split('?')[0]
+            logger.debug(f"Extracted {expected_path_type} ID: {item_id} from path parts: {path_parts}")
+        
+        # Additional validation for the extracted values
+        if not org_slug or not item_id:
+            raise SentryError(f"Failed to extract valid organization slug ({org_slug}) or item ID ({item_id})")
+            
+        logger.debug(f"Final extracted values - org_slug: {org_slug}, item_id: {item_id}")
+        return org_slug, item_id
+        
+    except Exception as e:
+        logger.error(f"Error parsing Sentry URL '{url}': {str(e)}")
+        raise
 
 
 def extract_issue_id(issue_id_or_url: str) -> str:
@@ -308,7 +359,16 @@ def extract_replay_id(replay_id_or_url: str) -> tuple[str, str]:
 
 def extract_trace_id(trace_id_or_url: str) -> tuple[str, str]:
     """
-    Extracts the Sentry trace ID and project ID from either a full URL or standalone IDs.
+    Extracts the Sentry trace ID and organization slug from either a full URL or standalone IDs.
+    
+    Args:
+        trace_id_or_url: Either a full Sentry trace URL or "org_slug:trace_id" format
+        
+    Returns:
+        Tuple of (org_slug, trace_id)
+        
+    Raises:
+        SentryError: If format is invalid
     """
     if not trace_id_or_url:
         raise SentryError("Missing trace_id_or_url argument")
@@ -316,14 +376,14 @@ def extract_trace_id(trace_id_or_url: str) -> tuple[str, str]:
     if trace_id_or_url.startswith(("http://", "https://")):
         return parse_sentry_url(trace_id_or_url, "traces")
     else:
-        # Expect format: project_id:trace_id
+        # Expect format: org_slug:trace_id
         try:
-            project_id, trace_id = trace_id_or_url.split(":")
+            org_slug, trace_id = trace_id_or_url.split(":")
         except ValueError:
             raise SentryError(
-                "Invalid trace ID format. Must be either a URL or 'project_id:trace_id'"
+                "Invalid trace ID format. Must be either a URL or 'org_slug:trace_id'"
             )
-        return project_id, trace_id
+        return org_slug, trace_id
 
 
 def create_stacktrace(latest_event: dict) -> str:
@@ -386,46 +446,27 @@ async def handle_get_trace(
     Args:
         http_client: The HTTP client to use
         auth_token: Sentry authentication token
-        trace_id_or_url: Either a full Sentry performance URL or "project_id:trace_id" format
+        trace_id_or_url: Either a full Sentry trace URL or "org_slug:trace_id" format
         
     Returns:
         SentryTraceData object containing the trace information
     """
     try:
-        project_id, trace_id = extract_trace_id(trace_id_or_url)
+        # Get org_slug and trace_id, preserving any hyphens in org_slug
+        org_slug, trace_id = extract_trace_id(trace_id_or_url)
+        logger.debug(f"[Trace] Using organization slug: {org_slug} for trace ID: {trace_id}")
         
-        # First get the organization slug by listing organizations
-        orgs_response = await http_client.get(
-            "organizations/",
-            headers={"Authorization": f"Bearer {auth_token}"}
-        )
+        # Construct API URL
+        api_url = f"organizations/{org_slug}/events/{trace_id}/"
+        logger.debug(f"[Trace] Making request to: {SENTRY_API_BASE}{api_url}")
         
-        if orgs_response.status_code == 401:
-            raise McpError("Error: Unauthorized. Please check your MCP_SENTRY_AUTH_TOKEN token.")
-            
-        orgs_response.raise_for_status()
-        orgs_data = orgs_response.json()
-        
-        if not orgs_data:
-            raise McpError("No organizations found for this auth token")
-            
-        org_slug = orgs_data[0]["slug"]  # Use first available org
-        
-        # Get project details using org context
-        project_response = await http_client.get(
-            f"projects/{org_slug}/{project_id}/",
-            headers={"Authorization": f"Bearer {auth_token}"}
-        )
-        
-        if project_response.status_code == 401:
-            raise McpError("Error: Unauthorized. Please check your MCP_SENTRY_AUTH_TOKEN token.")
-            
-        project_response.raise_for_status()
-        
-        # Now fetch the trace data using the correct API endpoint
+        # Fetch the trace data using the organization endpoint
         response = await http_client.get(
-            f"organizations/{org_slug}/projects/{project_id}/events/{trace_id}/",
-            headers={"Authorization": f"Bearer {auth_token}"},
+            api_url,
+            headers={
+                "Authorization": f"Bearer {auth_token}",
+                "Content-Type": "application/json",
+            },
             params={
                 "type": "transaction",
                 "field": [
@@ -439,13 +480,24 @@ async def handle_get_trace(
             }
         )
         
+        # Log full response details
+        log_response(response, "[Trace]")
+        
         if response.status_code == 401:
+            logger.error("[Trace] Authentication failed with 401 status code")
             raise McpError("Error: Unauthorized. Please check your MCP_SENTRY_AUTH_TOKEN token.")
         elif response.status_code == 404:
+            logger.error("[Trace] Resource not found with 404 status code")
             raise McpError("Trace not found. It may have been deleted or you may not have permission to access it.")
             
         response.raise_for_status()
         trace_data = response.json()
+        
+        if not trace_data:
+            logger.error("[Trace] Received empty response from Sentry API")
+            raise McpError("Received empty response from Sentry API")
+            
+        logger.debug(f"[Trace] Successfully parsed trace data with keys: {list(trace_data.keys())}")
         
         # Calculate duration from start_timestamp and timestamp if available
         duration = 0
@@ -454,15 +506,19 @@ async def handle_get_trace(
                 start_time = float(trace_data["start_timestamp"])
                 end_time = float(trace_data["timestamp"])
                 duration = (end_time - start_time) * 1000  # Convert to milliseconds
-            except (ValueError, TypeError):
+                logger.debug(f"[Trace] Calculated duration: {duration}ms from timestamps")
+            except (ValueError, TypeError) as e:
+                logger.warning(f"[Trace] Failed to calculate duration from timestamps: {str(e)}")
                 duration = trace_data.get("duration", 0)
         else:
+            logger.debug("[Trace] Using duration directly from trace data")
             duration = trace_data.get("duration", 0)
         
-        return SentryTraceData(
+        # Create SentryTraceData object
+        trace_obj = SentryTraceData(
             trace_id=trace_id,
             transaction=trace_data.get("transaction", ""),
-            project_id=project_id,
+            project_id=trace_data.get("project_id", ""),
             timestamp=trace_data.get("dateCreated", ""),
             duration=duration,
             status=trace_data.get("status", "unknown"),
@@ -470,11 +526,17 @@ async def handle_get_trace(
             tags=trace_data.get("tags", {})
         )
         
+        logger.debug("[Trace] Successfully created SentryTraceData object")
+        return trace_obj
+        
     except SentryError as e:
+        logger.error(f"[Trace] SentryError occurred: {str(e)}")
         raise McpError(str(e))
     except httpx.HTTPStatusError as e:
+        logger.error(f"[Trace] HTTP error occurred: {str(e)}")
         raise McpError(f"Error fetching Sentry trace: {str(e)}")
     except Exception as e:
+        logger.error(f"[Trace] Unexpected error occurred: {str(e)}")
         raise McpError(f"An error occurred: {str(e)}")
 
 
@@ -495,49 +557,51 @@ async def handle_get_replay(
         SentryReplayData object containing the replay information
     """
     try:
+        # Get org_slug and replay_id, preserving any hyphens in org_slug
         org_slug, replay_id = extract_replay_id(replay_id_or_url)
+        logger.debug(f"[Replay] Using organization slug: {org_slug} for replay ID: {replay_id}")
         
-        # First get the organization slug by listing organizations
-        orgs_response = await http_client.get(
-            "organizations/",
-            headers={"Authorization": f"Bearer {auth_token}"}
-        )
-        
-        if orgs_response.status_code == 401:
-            raise McpError("Error: Unauthorized. Please check your MCP_SENTRY_AUTH_TOKEN token.")
-            
-        orgs_response.raise_for_status()
-        orgs_data = orgs_response.json()
-        
-        if not orgs_data:
-            raise McpError("No organizations found for this auth token")
-            
-        org_slug = orgs_data[0]["slug"]  # Use first available org
+        # Construct API URL
+        api_url = f"organizations/{org_slug}/replays/{replay_id}/"
+        logger.debug(f"[Replay] Making request to: {SENTRY_API_BASE}{api_url}")
         
         # Use the correct API endpoint format for replays
         response = await http_client.get(
-            f"organizations/{org_slug}/replays/{replay_id}/",
-            headers={"Authorization": f"Bearer {auth_token}"},
-            params={
-                "detailed": "1"  # Get detailed replay information
-            }
+            api_url,
+            headers={
+                "Authorization": f"Bearer {auth_token}",
+                "Content-Type": "application/json",
+            },
+            params={"detailed": "1"}
         )
         
+        # Log full response details
+        log_response(response, "[Replay]")
+        
         if response.status_code == 401:
+            logger.error("[Replay] Authentication failed with 401 status code")
             raise McpError("Error: Unauthorized. Please check your MCP_SENTRY_AUTH_TOKEN token.")
         elif response.status_code == 404:
+            logger.error("[Replay] Resource not found with 404 status code")
             raise McpError("Replay not found. It may have been deleted or you may not have permission to access it.")
             
         response.raise_for_status()
-        response_json = response.json()
+        response_data = response.json()
         
+        if not response_data:
+            logger.error("[Replay] Received empty response from Sentry API")
+            raise McpError("Received empty response from Sentry API")
+            
         # Extract the nested data
-        if "data" not in response_json:
+        if "data" not in response_data:
+            logger.error("[Replay] Response missing 'data' key")
             raise McpError("Unexpected API response format: missing 'data' key")
             
-        replay_data = response_json["data"]
+        replay_data = response_data["data"]
+        logger.debug(f"[Replay] Successfully parsed replay data with keys: {list(replay_data.keys())}")
         
-        return SentryReplayData(
+        # Create SentryReplayData object
+        replay_obj = SentryReplayData(
             replay_id=replay_id,
             project_id=replay_data.get("project_id", ""),
             timestamp=replay_data.get("started_at", ""),
@@ -563,11 +627,17 @@ async def handle_get_replay(
             error_count=replay_data.get("count_errors", 0)
         )
         
+        logger.debug("[Replay] Successfully created SentryReplayData object")
+        return replay_obj
+        
     except SentryError as e:
+        logger.error(f"[Replay] SentryError occurred: {str(e)}")
         raise McpError(str(e))
     except httpx.HTTPStatusError as e:
+        logger.error(f"[Replay] HTTP error occurred: {str(e)}")
         raise McpError(f"Error fetching Sentry replay: {str(e)}")
     except Exception as e:
+        logger.error(f"[Replay] Unexpected error occurred: {str(e)}")
         raise McpError(f"An error occurred: {str(e)}")
 
 
@@ -576,6 +646,7 @@ async def handle_create_release(
     auth_token: str,
     version: str,
     projects: list[str],
+    org_slug: str,
     refs: list[dict] | None = None,
 ) -> SentryReleaseData:
     """
@@ -586,28 +657,14 @@ async def handle_create_release(
         auth_token: Sentry authentication token
         version: The version identifier for the release
         projects: List of project slugs to associate the release with
+        org_slug: The organization slug where the release should be created
         refs: Optional list of repository references
         
     Returns:
         SentryReleaseData object containing the created release information
     """
     try:
-        # First get the organization slug by listing organizations
-        orgs_response = await http_client.get(
-            "organizations/",
-            headers={"Authorization": f"Bearer {auth_token}"}
-        )
-        
-        if orgs_response.status_code == 401:
-            raise McpError("Error: Unauthorized. Please check your MCP_SENTRY_AUTH_TOKEN token.")
-            
-        orgs_response.raise_for_status()
-        orgs_data = orgs_response.json()
-        
-        if not orgs_data:
-            raise McpError("No organizations found for this auth token")
-            
-        org_slug = orgs_data[0]["slug"]  # Use first available org
+        logger.debug(f"Creating release version {version} for organization {org_slug}")
         
         payload = {
             "version": version,
@@ -703,58 +760,78 @@ async def handle_get_event(
     Args:
         http_client: The HTTP client to use
         auth_token: Sentry authentication token
-        issue_id_or_url: Either a full Sentry issue URL or just the issue ID
+        issue_id_or_url: Either a full Sentry issue URL or "org_slug:issue_id" format
         event_id: The specific event ID to retrieve
         
     Returns:
         SentryEventData object containing the event information
     """
     try:
-        # First get the organization slug by listing organizations
-        orgs_response = await http_client.get(
-            "organizations/",
-            headers={"Authorization": f"Bearer {auth_token}"}
-        )
+        # Extract the org_slug and issue_id, preserving any hyphens in org_slug
+        if issue_id_or_url.startswith(("http://", "https://")):
+            org_slug, issue_id = parse_sentry_url(issue_id_or_url, "issues")
+            logger.debug(f"[Event] Extracted from URL - org_slug: {org_slug}, issue_id: {issue_id}")
+        else:
+            # Expect format: org_slug:issue_id
+            try:
+                org_slug, issue_id = issue_id_or_url.split(":")
+                logger.debug(f"[Event] Parsed from string - org_slug: {org_slug}, issue_id: {issue_id}")
+            except ValueError:
+                logger.error(f"[Event] Failed to parse issue_id_or_url: {issue_id_or_url}")
+                raise SentryError(
+                    "Invalid issue ID format. Must be either a URL or 'org_slug:issue_id'"
+                )
+                
+        logger.debug(f"[Event] Using organization slug: {org_slug} for issue ID: {issue_id} and event ID: {event_id}")
         
-        if orgs_response.status_code == 401:
-            raise McpError("Error: Unauthorized. Please check your MCP_SENTRY_AUTH_TOKEN token.")
-            
-        orgs_response.raise_for_status()
-        orgs_data = orgs_response.json()
-        
-        if not orgs_data:
-            raise McpError("No organizations found for this auth token")
-            
-        org_slug = orgs_data[0]["slug"]  # Use first available org
-        
-        # Extract the issue ID
-        issue_id = extract_issue_id(issue_id_or_url)
+        # Construct API URL
+        api_url = f"organizations/{org_slug}/issues/{issue_id}/events/{event_id}/"
+        logger.debug(f"[Event] Making request to: {SENTRY_API_BASE}{api_url}")
         
         # Get the event data
         response = await http_client.get(
-            f"organizations/{org_slug}/issues/{issue_id}/events/{event_id}/",
-            headers={"Authorization": f"Bearer {auth_token}"}
+            api_url,
+            headers={
+                "Authorization": f"Bearer {auth_token}",
+                "Content-Type": "application/json",
+            }
         )
         
+        # Log full response details
+        log_response(response, "[Event]")
+        
         if response.status_code == 401:
+            logger.error("[Event] Authentication failed with 401 status code")
             raise McpError("Error: Unauthorized. Please check your MCP_SENTRY_AUTH_TOKEN token.")
         elif response.status_code == 404:
+            logger.error("[Event] Resource not found with 404 status code")
             raise McpError("Event not found. It may have been deleted or you may not have permission to access it.")
             
         response.raise_for_status()
         event_data = response.json()
         
+        if not event_data:
+            logger.error("[Event] Received empty response from Sentry API")
+            raise McpError("Received empty response from Sentry API")
+            
+        logger.debug(f"[Event] Successfully parsed event data with keys: {list(event_data.keys())}")
+        
         # Extract stacktrace if available
         stacktrace = None
         for entry in event_data.get("entries", []):
             if entry["type"] == "exception":
+                logger.debug("[Event] Found exception entry, extracting stacktrace")
                 stacktrace = create_stacktrace({"entries": [entry]})
                 break
         
-        return SentryEventData(
+        if not stacktrace:
+            logger.debug("[Event] No stacktrace found in event data")
+        
+        # Create SentryEventData object
+        event_obj = SentryEventData(
             event_id=event_data["eventID"],
             issue_id=event_data["groupID"],
-            project_id=event_data["projectID"],
+            project_id=event_data.get("projectID", ""),
             timestamp=event_data["dateCreated"],
             title=event_data.get("title", ""),
             message=event_data.get("message", ""),
@@ -765,11 +842,17 @@ async def handle_get_event(
             contexts=event_data.get("contexts", {})
         )
         
+        logger.debug("[Event] Successfully created SentryEventData object")
+        return event_obj
+        
     except SentryError as e:
+        logger.error(f"[Event] SentryError occurred: {str(e)}")
         raise McpError(str(e))
     except httpx.HTTPStatusError as e:
+        logger.error(f"[Event] HTTP error occurred: {str(e)}")
         raise McpError(f"Error fetching Sentry event: {str(e)}")
     except Exception as e:
+        logger.error(f"[Event] Unexpected error occurred: {str(e)}")
         raise McpError(f"An error occurred: {str(e)}")
 
 

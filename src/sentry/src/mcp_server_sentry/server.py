@@ -17,6 +17,94 @@ MISSING_AUTH_TOKEN_MESSAGE = (
 
 
 @dataclass
+class SentryTraceData:
+    trace_id: str
+    transaction: str
+    project_id: str
+    timestamp: str
+    duration: float
+    status: str
+    spans: list[dict]
+    tags: dict
+    
+    def to_text(self) -> str:
+        spans_text = "\n".join([
+            f"  - {span.get('op', 'unknown')}: {span.get('description', 'N/A')} ({span.get('duration', 0)}ms)"
+            for span in self.spans
+        ])
+        
+        tags_text = "\n".join([
+            f"  {key}: {value}"
+            for key, value in self.tags.items()
+        ])
+        
+        return f"""
+Sentry Performance Trace:
+ID: {self.trace_id}
+Transaction: {self.transaction}
+Project: {self.project_id}
+Timestamp: {self.timestamp}
+Duration: {self.duration}ms
+Status: {self.status}
+
+Spans:
+{spans_text}
+
+Tags:
+{tags_text}
+        """
+    
+    def to_tool_result(self) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
+        return [types.TextContent(type="text", text=self.to_text())]
+
+
+@dataclass
+class SentryReplayData:
+    replay_id: str
+    project_id: str
+    timestamp: str
+    duration: int
+    url: str
+    error_ids: list[str]
+    activity_count: int
+    
+    def to_text(self) -> str:
+        return f"""
+Sentry Replay:
+ID: {self.replay_id}
+Project: {self.project_id}
+Timestamp: {self.timestamp}
+Duration: {self.duration}ms
+URL: {self.url}
+Related Error IDs: {', '.join(self.error_ids) if self.error_ids else 'None'}
+User Activity Count: {self.activity_count}
+        """
+    
+    def to_tool_result(self) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
+        return [types.TextContent(type="text", text=self.to_text())]
+
+
+@dataclass
+class SentryReleaseData:
+    version: str
+    url: str
+    projects: list[str]
+    dateCreated: str
+    
+    def to_text(self) -> str:
+        return f"""
+Sentry Release Created:
+Version: {self.version}
+URL: {self.url}
+Projects: {', '.join(self.projects)}
+Date Created: {self.dateCreated}
+        """
+    
+    def to_tool_result(self) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
+        return [types.TextContent(type="text", text=self.to_text())]
+
+
+@dataclass
 class SentryIssueData:
     title: str
     issue_id: str
@@ -90,6 +178,88 @@ def extract_issue_id(issue_id_or_url: str) -> str:
     return issue_id
 
 
+def extract_replay_id(replay_id_or_url: str) -> tuple[str, str]:
+    """
+    Extracts the Sentry replay ID and project ID from either a full URL or standalone IDs.
+    
+    Args:
+        replay_id_or_url: Either a full Sentry replay URL or "project_id:replay_id" format
+        
+    Returns:
+        Tuple of (project_id, replay_id)
+    """
+    if not replay_id_or_url:
+        raise SentryError("Missing replay_id_or_url argument")
+
+    if replay_id_or_url.startswith(("http://", "https://")):
+        parsed_url = urlparse(replay_id_or_url)
+        if not parsed_url.hostname or not parsed_url.hostname.endswith(".sentry.io"):
+            raise SentryError("Invalid Sentry URL. Must be a URL ending with .sentry.io")
+
+        # Extract replay ID from path
+        path_parts = parsed_url.path.strip("/").split("/")
+        if len(path_parts) < 2 or path_parts[0] != "replays":
+            raise SentryError(
+                "Invalid Sentry replay URL. Path must contain '/replays/{replay_id}'"
+            )
+        replay_id = path_parts[1]
+
+        # Extract project ID from query parameters
+        query_params = dict(param.split('=') for param in parsed_url.query.split('&') if '=' in param)
+        project_id = query_params.get('project')
+        if not project_id:
+            raise SentryError("Missing project ID in replay URL query parameters")
+
+    else:
+        # Expect format: project_id:replay_id
+        try:
+            project_id, replay_id = replay_id_or_url.split(":")
+        except ValueError:
+            raise SentryError(
+                "Invalid replay ID format. Must be either a URL or 'project_id:replay_id'"
+            )
+
+    return project_id, replay_id
+
+
+def extract_trace_id(trace_id_or_url: str) -> tuple[str, str]:
+    """
+    Extracts the Sentry trace ID and project ID from either a full URL or standalone IDs.
+    
+    Args:
+        trace_id_or_url: Either a full Sentry performance URL or "project_id:trace_id" format
+        
+    Returns:
+        Tuple of (project_id, trace_id)
+    """
+    if not trace_id_or_url:
+        raise SentryError("Missing trace_id_or_url argument")
+
+    if trace_id_or_url.startswith(("http://", "https://")):
+        parsed_url = urlparse(trace_id_or_url)
+        if not parsed_url.hostname or not parsed_url.hostname.endswith(".sentry.io"):
+            raise SentryError("Invalid Sentry URL. Must be a URL ending with .sentry.io")
+
+        path_parts = parsed_url.path.strip("/").split("/")
+        if len(path_parts) < 4 or path_parts[-2] != "performance":
+            raise SentryError(
+                "Invalid Sentry trace URL. Path must contain '/projects/{org}/{project}/performance/{trace_id}'"
+            )
+
+        project_id = path_parts[-3]
+        trace_id = path_parts[-1]
+    else:
+        # Expect format: project_id:trace_id
+        try:
+            project_id, trace_id = trace_id_or_url.split(":")
+        except ValueError:
+            raise SentryError(
+                "Invalid trace ID format. Must be either a URL or 'project_id:trace_id'"
+            )
+
+    return project_id, trace_id
+
+
 def create_stacktrace(latest_event: dict) -> str:
     """
     Creates a formatted stacktrace string from the latest Sentry event.
@@ -137,6 +307,221 @@ def create_stacktrace(latest_event: dict) -> str:
             stacktraces.append(stacktrace_text)
 
     return "\n".join(stacktraces) if stacktraces else "No stacktrace found"
+
+
+async def handle_get_trace(
+    http_client: httpx.AsyncClient,
+    auth_token: str,
+    trace_id_or_url: str
+) -> SentryTraceData:
+    """
+    Retrieves trace data from Sentry.
+    
+    Args:
+        http_client: The HTTP client to use
+        auth_token: Sentry authentication token
+        trace_id_or_url: Either a full Sentry performance URL or "project_id:trace_id" format
+        
+    Returns:
+        SentryTraceData object containing the trace information
+    """
+    try:
+        project_id, trace_id = extract_trace_id(trace_id_or_url)
+        
+        # First get the organization slug by listing organizations
+        orgs_response = await http_client.get(
+            "organizations/",
+            headers={"Authorization": f"Bearer {auth_token}"}
+        )
+        
+        if orgs_response.status_code == 401:
+            raise McpError("Error: Unauthorized. Please check your MCP_SENTRY_AUTH_TOKEN token.")
+            
+        orgs_response.raise_for_status()
+        orgs_data = orgs_response.json()
+        
+        if not orgs_data:
+            raise McpError("No organizations found for this auth token")
+            
+        org_slug = orgs_data[0]["slug"]  # Use first available org
+        
+        # Use the correct API endpoint format for traces
+        response = await http_client.get(
+            f"organizations/{org_slug}/events/{trace_id}/",
+            headers={"Authorization": f"Bearer {auth_token}"},
+            params={
+                "project": project_id
+            }
+        )
+        
+        if response.status_code == 401:
+            raise McpError("Error: Unauthorized. Please check your MCP_SENTRY_AUTH_TOKEN token.")
+        elif response.status_code == 404:
+            raise McpError("Trace not found. It may have been deleted or you may not have permission to access it.")
+            
+        response.raise_for_status()
+        trace_data = response.json()
+        
+        return SentryTraceData(
+            trace_id=trace_id,
+            transaction=trace_data.get("transaction", ""),
+            project_id=project_id,
+            timestamp=trace_data.get("dateCreated", ""),
+            duration=trace_data.get("duration", 0),
+            status=trace_data.get("status", "unknown"),
+            spans=trace_data.get("spans", []),
+            tags=trace_data.get("tags", {})
+        )
+        
+    except SentryError as e:
+        raise McpError(str(e))
+    except httpx.HTTPStatusError as e:
+        raise McpError(f"Error fetching Sentry trace: {str(e)}")
+    except Exception as e:
+        raise McpError(f"An error occurred: {str(e)}")
+
+
+async def handle_get_replay(
+    http_client: httpx.AsyncClient,
+    auth_token: str,
+    replay_id_or_url: str
+) -> SentryReplayData:
+    """
+    Retrieves replay data from Sentry.
+    
+    Args:
+        http_client: The HTTP client to use
+        auth_token: Sentry authentication token
+        replay_id_or_url: Either a full Sentry replay URL or "project_id:replay_id" format
+        
+    Returns:
+        SentryReplayData object containing the replay information
+    """
+    try:
+        project_id, replay_id = extract_replay_id(replay_id_or_url)
+        
+        # First get the organization slug by listing organizations
+        orgs_response = await http_client.get(
+            "organizations/",
+            headers={"Authorization": f"Bearer {auth_token}"}
+        )
+        
+        if orgs_response.status_code == 401:
+            raise McpError("Error: Unauthorized. Please check your MCP_SENTRY_AUTH_TOKEN token.")
+            
+        orgs_response.raise_for_status()
+        orgs_data = orgs_response.json()
+        
+        if not orgs_data:
+            raise McpError("No organizations found for this auth token")
+            
+        org_slug = orgs_data[0]["slug"]  # Use first available org
+        
+        # Use the correct API endpoint format for replays
+        response = await http_client.get(
+            f"organizations/{org_slug}/replays/{replay_id}/",
+            headers={"Authorization": f"Bearer {auth_token}"},
+            params={
+                "project": project_id,
+                "detailed": "1"  # Get detailed replay information
+            }
+        )
+        
+        if response.status_code == 401:
+            raise McpError("Error: Unauthorized. Please check your MCP_SENTRY_AUTH_TOKEN token.")
+        elif response.status_code == 404:
+            raise McpError("Replay not found. It may have been deleted or you may not have permission to access it.")
+            
+        response.raise_for_status()
+        replay_data = response.json()
+        
+        return SentryReplayData(
+            replay_id=replay_id,
+            project_id=project_id,
+            timestamp=replay_data.get("startedAt", replay_data.get("timestamp", "")),
+            duration=replay_data.get("duration", 0),
+            url=replay_data.get("url", ""),
+            error_ids=replay_data.get("errorIds", []),
+            activity_count=replay_data.get("activityCount", 0)
+        )
+        
+    except SentryError as e:
+        raise McpError(str(e))
+    except httpx.HTTPStatusError as e:
+        raise McpError(f"Error fetching Sentry replay: {str(e)}")
+    except Exception as e:
+        raise McpError(f"An error occurred: {str(e)}")
+
+
+async def handle_create_release(
+    http_client: httpx.AsyncClient,
+    auth_token: str,
+    version: str,
+    projects: list[str],
+    refs: list[dict] | None = None,
+) -> SentryReleaseData:
+    """
+    Creates a new release in Sentry.
+    
+    Args:
+        http_client: The HTTP client to use
+        auth_token: Sentry authentication token
+        version: The version identifier for the release
+        projects: List of project slugs to associate the release with
+        refs: Optional list of repository references
+        
+    Returns:
+        SentryReleaseData object containing the created release information
+    """
+    try:
+        # First get the organization slug by listing organizations
+        orgs_response = await http_client.get(
+            "organizations/",
+            headers={"Authorization": f"Bearer {auth_token}"}
+        )
+        
+        if orgs_response.status_code == 401:
+            raise McpError("Error: Unauthorized. Please check your MCP_SENTRY_AUTH_TOKEN token.")
+            
+        orgs_response.raise_for_status()
+        orgs_data = orgs_response.json()
+        
+        if not orgs_data:
+            raise McpError("No organizations found for this auth token")
+            
+        org_slug = orgs_data[0]["slug"]  # Use first available org
+        
+        payload = {
+            "version": version,
+            "projects": projects,
+        }
+        
+        if refs:
+            payload["refs"] = refs
+            
+        response = await http_client.post(
+            f"organizations/{org_slug}/releases/",
+            headers={"Authorization": f"Bearer {auth_token}"},
+            json=payload
+        )
+        
+        if response.status_code == 401:
+            raise McpError("Error: Unauthorized. Please check your MCP_SENTRY_AUTH_TOKEN token.")
+            
+        response.raise_for_status()
+        release_data = response.json()
+        
+        return SentryReleaseData(
+            version=release_data["version"],
+            url=release_data.get("url", ""),
+            projects=release_data["projects"],
+            dateCreated=release_data["dateCreated"]
+        )
+        
+    except httpx.HTTPStatusError as e:
+        raise McpError(f"Error creating Sentry release: {str(e)}")
+    except Exception as e:
+        raise McpError(f"An error occurred: {str(e)}")
 
 
 async def handle_sentry_issue(
@@ -240,6 +625,86 @@ async def serve(auth_token: str) -> Server:
                     },
                     "required": ["issue_id_or_url"]
                 }
+            ),
+            types.Tool(
+                name="create_release",
+                description="""Create a new release in Sentry. Use this tool when you need to:
+                - Create a new release for deployment tracking
+                - Associate commits with a release
+                - Track release adoption and stability
+                - Monitor release health metrics""",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "version": {
+                            "type": "string",
+                            "description": "Unique identifier for the release (e.g. commit hash, version number)"
+                        },
+                        "projects": {
+                            "type": "array",
+                            "items": {
+                                "type": "string"
+                            },
+                            "description": "List of project slugs to associate the release with"
+                        },
+                        "refs": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "repository": {
+                                        "type": "string"
+                                    },
+                                    "commit": {
+                                        "type": "string"
+                                    },
+                                    "previousCommit": {
+                                        "type": "string"
+                                    }
+                                }
+                            },
+                            "description": "Optional list of repository references"
+                        }
+                    },
+                    "required": ["version", "projects"]
+                }
+            ),
+            types.Tool(
+                name="get_replay",
+                description="""Retrieve and analyze a Sentry session replay. Use this tool when you need to:
+                - Access session replay metadata
+                - Link replays to related errors
+                - Analyze user activity during a session
+                - Get replay duration and timing information""",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "replay_id_or_url": {
+                            "type": "string",
+                            "description": "Sentry replay ID (project_id:replay_id format) or replay URL"
+                        }
+                    },
+                    "required": ["replay_id_or_url"]
+                }
+            ),
+            types.Tool(
+                name="get_trace",
+                description="""Retrieve and analyze a Sentry performance trace. Use this tool when you need to:
+                - Investigate transaction performance
+                - Analyze distributed tracing data
+                - View span operations and timings
+                - Check transaction status and tags
+                - Monitor end-to-end request flow""",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "trace_id_or_url": {
+                            "type": "string",
+                            "description": "Sentry trace ID (project_id:trace_id format) or performance URL"
+                        }
+                    },
+                    "required": ["trace_id_or_url"]
+                }
             )
         ]
 
@@ -247,14 +712,48 @@ async def serve(auth_token: str) -> Server:
     async def handle_call_tool(
         name: str, arguments: dict | None
     ) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
-        if name != "get_sentry_issue":
-            raise ValueError(f"Unknown tool: {name}")
-
-        if not arguments or "issue_id_or_url" not in arguments:
-            raise ValueError("Missing issue_id_or_url argument")
-
-        issue_data = await handle_sentry_issue(http_client, auth_token, arguments["issue_id_or_url"])
-        return issue_data.to_tool_result()
+        if not arguments:
+            raise ValueError("Missing arguments")
+            
+        if name == "get_sentry_issue":
+            if "issue_id_or_url" not in arguments:
+                raise ValueError("Missing issue_id_or_url argument")
+            issue_data = await handle_sentry_issue(http_client, auth_token, arguments["issue_id_or_url"])
+            return issue_data.to_tool_result()
+            
+        elif name == "create_release":
+            if "version" not in arguments or "projects" not in arguments:
+                raise ValueError("Missing required arguments: version and projects")
+            release_data = await handle_create_release(
+                http_client,
+                auth_token,
+                arguments["version"],
+                arguments["projects"],
+                arguments.get("refs")
+            )
+            return release_data.to_tool_result()
+            
+        elif name == "get_replay":
+            if "replay_id_or_url" not in arguments:
+                raise ValueError("Missing replay_id_or_url argument")
+            replay_data = await handle_get_replay(
+                http_client,
+                auth_token,
+                arguments["replay_id_or_url"]
+            )
+            return replay_data.to_tool_result()
+            
+        elif name == "get_trace":
+            if "trace_id_or_url" not in arguments:
+                raise ValueError("Missing trace_id_or_url argument")
+            trace_data = await handle_get_trace(
+                http_client,
+                auth_token,
+                arguments["trace_id_or_url"]
+            )
+            return trace_data.to_tool_result()
+            
+        raise ValueError(f"Unknown tool: {name}")
 
     return server
 

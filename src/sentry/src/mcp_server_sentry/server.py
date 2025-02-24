@@ -64,21 +64,65 @@ class SentryReplayData:
     project_id: str
     timestamp: str
     duration: int
-    url: str
+    environment: str
+    urls: list[str]
     error_ids: list[str]
+    # Browser info
+    browser_name: str
+    browser_version: str
+    # Device info
+    device_name: str
+    device_family: str
+    os_name: str
+    os_version: str
+    # User info
+    user_name: str | None
+    user_email: str | None
+    # Activity counts
     activity_count: int
+    dead_clicks: int
+    rage_clicks: int
+    error_count: int
     
     def to_text(self) -> str:
-        return f"""
-Sentry Replay:
-ID: {self.replay_id}
-Project: {self.project_id}
-Timestamp: {self.timestamp}
-Duration: {self.duration}ms
-URL: {self.url}
-Related Error IDs: {', '.join(self.error_ids) if self.error_ids else 'None'}
-User Activity Count: {self.activity_count}
-        """
+        basic_info = f"""
+### Sentry Replay Details
+
+| Field | Value |
+|-------|-------|
+| ID | {self.replay_id} |
+| Project | {self.project_id} |
+| Environment | {self.environment} |
+| Duration | {self.duration}ms |
+| Timestamp | {self.timestamp} |
+| URLs Visited | {', '.join(self.urls)} |
+| Error IDs | {', '.join(self.error_ids) if self.error_ids else 'None'} |
+
+### Device Information
+
+| Field | Value |
+|-------|-------|
+| Browser | {self.browser_name} {self.browser_version} |
+| Device | {self.device_name} ({self.device_family}) |
+| OS | {self.os_name} {self.os_version} |
+
+### User Information
+
+| Field | Value |
+|-------|-------|
+| Name | {self.user_name or 'Anonymous'} |
+| Email | {self.user_email or 'N/A'} |
+
+### Activity Metrics
+
+| Metric | Count |
+|--------|-------|
+| Total Activity | {self.activity_count} |
+| Dead Clicks | {self.dead_clicks} |
+| Rage Clicks | {self.rage_clicks} |
+| Errors | {self.error_count} |
+"""
+        return basic_info
     
     def to_tool_result(self) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
         return [types.TextContent(type="text", text=self.to_text())]
@@ -180,13 +224,13 @@ def extract_issue_id(issue_id_or_url: str) -> str:
 
 def extract_replay_id(replay_id_or_url: str) -> tuple[str, str]:
     """
-    Extracts the Sentry replay ID and project ID from either a full URL or standalone IDs.
+    Extracts the Sentry replay ID and org slug from either a full URL or standalone IDs.
     
     Args:
-        replay_id_or_url: Either a full Sentry replay URL or "project_id:replay_id" format
+        replay_id_or_url: Either a full Sentry replay URL or "org_slug:replay_id" format
         
     Returns:
-        Tuple of (project_id, replay_id)
+        Tuple of (org_slug, replay_id)
     """
     if not replay_id_or_url:
         raise SentryError("Missing replay_id_or_url argument")
@@ -196,7 +240,9 @@ def extract_replay_id(replay_id_or_url: str) -> tuple[str, str]:
         if not parsed_url.hostname or not parsed_url.hostname.endswith(".sentry.io"):
             raise SentryError("Invalid Sentry URL. Must be a URL ending with .sentry.io")
 
-        # Extract replay ID from path
+        # Extract org slug from hostname (e.g., "buildwithcode.sentry.io")
+        org_slug = parsed_url.hostname.split('.')[0]
+        
         path_parts = parsed_url.path.strip("/").split("/")
         if len(path_parts) < 2 or path_parts[0] != "replays":
             raise SentryError(
@@ -210,16 +256,17 @@ def extract_replay_id(replay_id_or_url: str) -> tuple[str, str]:
         if not project_id:
             raise SentryError("Missing project ID in replay URL query parameters")
 
+        replay_id = path_parts[-1]
     else:
-        # Expect format: project_id:replay_id
+        # Expect format: org_slug:replay_id
         try:
-            project_id, replay_id = replay_id_or_url.split(":")
+            org_slug, replay_id = replay_id_or_url.split(":")
         except ValueError:
             raise SentryError(
-                "Invalid replay ID format. Must be either a URL or 'project_id:replay_id'"
+                "Invalid replay ID format. Must be either a URL or 'org_slug:replay_id'"
             )
 
-    return project_id, replay_id
+    return org_slug, replay_id
 
 
 def extract_trace_id(trace_id_or_url: str) -> tuple[str, str]:
@@ -345,12 +392,31 @@ async def handle_get_trace(
             
         org_slug = orgs_data[0]["slug"]  # Use first available org
         
-        # Use the correct API endpoint format for traces
+        # Get project details using org context
+        project_response = await http_client.get(
+            f"projects/{org_slug}/{project_id}/",
+            headers={"Authorization": f"Bearer {auth_token}"}
+        )
+        
+        if project_response.status_code == 401:
+            raise McpError("Error: Unauthorized. Please check your MCP_SENTRY_AUTH_TOKEN token.")
+            
+        project_response.raise_for_status()
+        
+        # Now fetch the trace data using the correct API endpoint
         response = await http_client.get(
-            f"organizations/{org_slug}/events/{trace_id}/",
+            f"organizations/{org_slug}/projects/{project_id}/events/{trace_id}/",
             headers={"Authorization": f"Bearer {auth_token}"},
             params={
-                "project": project_id
+                "type": "transaction",
+                "field": [
+                    "transaction",
+                    "timestamp",
+                    "start_timestamp",
+                    "spans",
+                    "tags",
+                    "contexts"
+                ]
             }
         )
         
@@ -362,12 +428,24 @@ async def handle_get_trace(
         response.raise_for_status()
         trace_data = response.json()
         
+        # Calculate duration from start_timestamp and timestamp if available
+        duration = 0
+        if "start_timestamp" in trace_data and "timestamp" in trace_data:
+            try:
+                start_time = float(trace_data["start_timestamp"])
+                end_time = float(trace_data["timestamp"])
+                duration = (end_time - start_time) * 1000  # Convert to milliseconds
+            except (ValueError, TypeError):
+                duration = trace_data.get("duration", 0)
+        else:
+            duration = trace_data.get("duration", 0)
+        
         return SentryTraceData(
             trace_id=trace_id,
             transaction=trace_data.get("transaction", ""),
             project_id=project_id,
             timestamp=trace_data.get("dateCreated", ""),
-            duration=trace_data.get("duration", 0),
+            duration=duration,
             status=trace_data.get("status", "unknown"),
             spans=trace_data.get("spans", []),
             tags=trace_data.get("tags", {})
@@ -392,17 +470,17 @@ async def handle_get_replay(
     Args:
         http_client: The HTTP client to use
         auth_token: Sentry authentication token
-        replay_id_or_url: Either a full Sentry replay URL or "project_id:replay_id" format
+        replay_id_or_url: Either a full Sentry replay URL or "org_slug:replay_id" format
         
     Returns:
         SentryReplayData object containing the replay information
     """
     try:
-        project_id, replay_id = extract_replay_id(replay_id_or_url)
+        org_slug, replay_id = extract_replay_id(replay_id_or_url)
         
-        # First get the organization slug by listing organizations
-        orgs_response = await http_client.get(
-            "organizations/",
+        # Fetch the replay data using the correct API endpoint
+        response = await http_client.get(
+            f"organizations/{org_slug}/replays/{replay_id}/",
             headers={"Authorization": f"Bearer {auth_token}"}
         )
         
@@ -433,16 +511,38 @@ async def handle_get_replay(
             raise McpError("Replay not found. It may have been deleted or you may not have permission to access it.")
             
         response.raise_for_status()
-        replay_data = response.json()
+        response_json = response.json()
+        
+        # Extract the nested data
+        if "data" not in response_json:
+            raise McpError("Unexpected API response format: missing 'data' key")
+            
+        replay_data = response_json["data"]
         
         return SentryReplayData(
             replay_id=replay_id,
-            project_id=project_id,
-            timestamp=replay_data.get("startedAt", replay_data.get("timestamp", "")),
+            project_id=replay_data.get("project_id", ""),
+            timestamp=replay_data.get("started_at", ""),
             duration=replay_data.get("duration", 0),
-            url=replay_data.get("url", ""),
-            error_ids=replay_data.get("errorIds", []),
-            activity_count=replay_data.get("activityCount", 0)
+            environment=replay_data.get("environment", "unknown"),
+            urls=replay_data.get("urls", []),
+            error_ids=replay_data.get("error_ids", []),
+            # Browser info
+            browser_name=replay_data.get("browser", {}).get("name", "Unknown"),
+            browser_version=replay_data.get("browser", {}).get("version", "Unknown"),
+            # Device info
+            device_name=replay_data.get("device", {}).get("name", "Unknown"),
+            device_family=replay_data.get("device", {}).get("family", "Unknown"),
+            os_name=replay_data.get("os", {}).get("name", "Unknown"),
+            os_version=replay_data.get("os", {}).get("version", "Unknown"),
+            # User info
+            user_name=replay_data.get("user", {}).get("display_name"),
+            user_email=replay_data.get("user", {}).get("email"),
+            # Activity counts
+            activity_count=replay_data.get("activity", 0),
+            dead_clicks=replay_data.get("count_dead_clicks", 0),
+            rage_clicks=replay_data.get("count_rage_clicks", 0),
+            error_count=replay_data.get("count_errors", 0)
         )
         
     except SentryError as e:
@@ -678,13 +778,32 @@ async def serve(auth_token: str) -> Server:
                 - Get replay duration and timing information""",
                 inputSchema={
                     "type": "object",
-                    "properties": {
-                        "replay_id_or_url": {
-                            "type": "string",
-                            "description": "Sentry replay ID (project_id:replay_id format) or replay URL"
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "properties": {
+                                "url": {
+                                    "type": "string",
+                                    "description": "Full Sentry replay URL (e.g., https://buildwithcode.sentry.io/replays/{replay_id})"
+                                }
+                            },
+                            "required": ["url"]
+                        },
+                        {
+                            "type": "object",
+                            "properties": {
+                                "organization_slug": {
+                                    "type": "string",
+                                    "description": "Sentry organization slug (e.g., 'buildwithcode')"
+                                },
+                                "replay_id": {
+                                    "type": "string",
+                                    "description": "Sentry replay ID"
+                                }
+                            },
+                            "required": ["organization_slug", "replay_id"]
                         }
-                    },
-                    "required": ["replay_id_or_url"]
+                    ]
                 }
             ),
             types.Tool(
@@ -734,13 +853,14 @@ async def serve(auth_token: str) -> Server:
             return release_data.to_tool_result()
             
         elif name == "get_replay":
-            if "replay_id_or_url" not in arguments:
-                raise ValueError("Missing replay_id_or_url argument")
-            replay_data = await handle_get_replay(
-                http_client,
-                auth_token,
-                arguments["replay_id_or_url"]
-            )
+            if "url" in arguments:
+                replay_data = await handle_get_replay(http_client, auth_token, arguments["url"])
+            elif "organization_slug" in arguments and "replay_id" in arguments:
+                # Construct the input format expected by handle_get_replay
+                replay_input = f"{arguments['organization_slug']}:{arguments['replay_id']}"
+                replay_data = await handle_get_replay(http_client, auth_token, replay_input)
+            else:
+                raise ValueError("Must provide either url or both organization_slug and replay_id")
             return replay_data.to_tool_result()
             
         elif name == "get_trace":

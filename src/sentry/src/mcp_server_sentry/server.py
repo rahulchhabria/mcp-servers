@@ -478,9 +478,9 @@ async def handle_get_replay(
     try:
         org_slug, replay_id = extract_replay_id(replay_id_or_url)
         
-        # Fetch the replay data using the correct API endpoint
-        response = await http_client.get(
-            f"organizations/{org_slug}/replays/{replay_id}/",
+        # First get the organization slug by listing organizations
+        orgs_response = await http_client.get(
+            "organizations/",
             headers={"Authorization": f"Bearer {auth_token}"}
         )
         
@@ -500,7 +500,6 @@ async def handle_get_replay(
             f"organizations/{org_slug}/replays/{replay_id}/",
             headers={"Authorization": f"Bearer {auth_token}"},
             params={
-                "project": project_id,
                 "detailed": "1"  # Get detailed replay information
             }
         )

@@ -186,33 +186,97 @@ Event Count: {self.count}
         return [types.TextContent(type="text", text=self.to_text())]
 
 
+@dataclass
+class SentryEventData:
+    event_id: str
+    issue_id: str
+    project_id: str
+    timestamp: str
+    title: str
+    message: str
+    level: str
+    platform: str
+    stacktrace: str | None
+    tags: list[dict]
+    contexts: dict
+    
+    def to_text(self) -> str:
+        tags_text = "\n".join([
+            f"  {tag['key']}: {tag['value']}"
+            for tag in self.tags
+        ])
+        
+        return f"""
+Sentry Event Details:
+Event ID: {self.event_id}
+Issue ID: {self.issue_id}
+Project: {self.project_id}
+Title: {self.title}
+Message: {self.message}
+Level: {self.level}
+Platform: {self.platform}
+Timestamp: {self.timestamp}
+
+Tags:
+{tags_text}
+
+Stacktrace:
+{self.stacktrace if self.stacktrace else 'No stacktrace available'}
+        """
+    
+    def to_tool_result(self) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
+        return [types.TextContent(type="text", text=self.to_text())]
+
+
 class SentryError(Exception):
     pass
+
+
+def parse_sentry_url(url: str, expected_path_type: str) -> tuple[str, str]:
+    """
+    Parses a Sentry URL to extract organization slug and ID.
+    
+    Args:
+        url: Full Sentry URL
+        expected_path_type: The expected path component ('issues', 'replays', or 'traces')
+        
+    Returns:
+        Tuple of (org_slug, id)
+        
+    Raises:
+        SentryError: If URL format is invalid
+    """
+    parsed_url = urlparse(url)
+    if not parsed_url.hostname or not parsed_url.hostname.endswith(".sentry.io"):
+        raise SentryError("Invalid Sentry URL. Must be a URL ending with .sentry.io")
+
+    # Extract org slug from hostname (e.g., "buildwithcode.sentry.io")
+    org_slug = parsed_url.hostname.split('.')[0]
+    
+    path_parts = parsed_url.path.strip("/").split("/")
+    
+    # Handle special case for traces which have an extra 'trace' component
+    if expected_path_type == 'traces':
+        if len(path_parts) < 3 or path_parts[0] != 'traces' or path_parts[1] != 'trace':
+            raise SentryError(f"Invalid Sentry {expected_path_type} URL. Path must contain '/traces/trace/{{id}}'")
+        item_id = path_parts[2].rstrip('/')
+    else:
+        if len(path_parts) < 2 or path_parts[0] != expected_path_type:
+            raise SentryError(f"Invalid Sentry {expected_path_type} URL. Path must contain '/{expected_path_type}/{{id}}'")
+        item_id = path_parts[1].rstrip('/')
+    
+    return org_slug, item_id
 
 
 def extract_issue_id(issue_id_or_url: str) -> str:
     """
     Extracts the Sentry issue ID from either a full URL or a standalone ID.
-
-    This function validates the input and returns the numeric issue ID.
-    It raises SentryError for invalid inputs, including empty strings,
-    non-Sentry URLs, malformed paths, and non-numeric IDs.
     """
     if not issue_id_or_url:
         raise SentryError("Missing issue_id_or_url argument")
 
     if issue_id_or_url.startswith(("http://", "https://")):
-        parsed_url = urlparse(issue_id_or_url)
-        if not parsed_url.hostname or not parsed_url.hostname.endswith(".sentry.io"):
-            raise SentryError("Invalid Sentry URL. Must be a URL ending with .sentry.io")
-
-        path_parts = parsed_url.path.strip("/").split("/")
-        if len(path_parts) < 2 or path_parts[0] != "issues":
-            raise SentryError(
-                "Invalid Sentry issue URL. Path must contain '/issues/{issue_id}'"
-            )
-
-        issue_id = path_parts[-1]
+        _, issue_id = parse_sentry_url(issue_id_or_url, "issues")
     else:
         issue_id = issue_id_or_url
 
@@ -225,38 +289,12 @@ def extract_issue_id(issue_id_or_url: str) -> str:
 def extract_replay_id(replay_id_or_url: str) -> tuple[str, str]:
     """
     Extracts the Sentry replay ID and org slug from either a full URL or standalone IDs.
-    
-    Args:
-        replay_id_or_url: Either a full Sentry replay URL or "org_slug:replay_id" format
-        
-    Returns:
-        Tuple of (org_slug, replay_id)
     """
     if not replay_id_or_url:
         raise SentryError("Missing replay_id_or_url argument")
 
     if replay_id_or_url.startswith(("http://", "https://")):
-        parsed_url = urlparse(replay_id_or_url)
-        if not parsed_url.hostname or not parsed_url.hostname.endswith(".sentry.io"):
-            raise SentryError("Invalid Sentry URL. Must be a URL ending with .sentry.io")
-
-        # Extract org slug from hostname (e.g., "buildwithcode.sentry.io")
-        org_slug = parsed_url.hostname.split('.')[0]
-        
-        path_parts = parsed_url.path.strip("/").split("/")
-        if len(path_parts) < 2 or path_parts[0] != "replays":
-            raise SentryError(
-                "Invalid Sentry replay URL. Path must contain '/replays/{replay_id}'"
-            )
-        replay_id = path_parts[1]
-
-        # Extract project ID from query parameters
-        query_params = dict(param.split('=') for param in parsed_url.query.split('&') if '=' in param)
-        project_id = query_params.get('project')
-        if not project_id:
-            raise SentryError("Missing project ID in replay URL query parameters")
-
-        replay_id = path_parts[-1]
+        return parse_sentry_url(replay_id_or_url, "replays")
     else:
         # Expect format: org_slug:replay_id
         try:
@@ -265,36 +303,18 @@ def extract_replay_id(replay_id_or_url: str) -> tuple[str, str]:
             raise SentryError(
                 "Invalid replay ID format. Must be either a URL or 'org_slug:replay_id'"
             )
-
-    return org_slug, replay_id
+        return org_slug, replay_id
 
 
 def extract_trace_id(trace_id_or_url: str) -> tuple[str, str]:
     """
     Extracts the Sentry trace ID and project ID from either a full URL or standalone IDs.
-    
-    Args:
-        trace_id_or_url: Either a full Sentry performance URL or "project_id:trace_id" format
-        
-    Returns:
-        Tuple of (project_id, trace_id)
     """
     if not trace_id_or_url:
         raise SentryError("Missing trace_id_or_url argument")
 
     if trace_id_or_url.startswith(("http://", "https://")):
-        parsed_url = urlparse(trace_id_or_url)
-        if not parsed_url.hostname or not parsed_url.hostname.endswith(".sentry.io"):
-            raise SentryError("Invalid Sentry URL. Must be a URL ending with .sentry.io")
-
-        path_parts = parsed_url.path.strip("/").split("/")
-        if len(path_parts) < 4 or path_parts[-2] != "performance":
-            raise SentryError(
-                "Invalid Sentry trace URL. Path must contain '/projects/{org}/{project}/performance/{trace_id}'"
-            )
-
-        project_id = path_parts[-3]
-        trace_id = path_parts[-1]
+        return parse_sentry_url(trace_id_or_url, "traces")
     else:
         # Expect format: project_id:trace_id
         try:
@@ -303,8 +323,7 @@ def extract_trace_id(trace_id_or_url: str) -> tuple[str, str]:
             raise SentryError(
                 "Invalid trace ID format. Must be either a URL or 'project_id:trace_id'"
             )
-
-    return project_id, trace_id
+        return project_id, trace_id
 
 
 def create_stacktrace(latest_event: dict) -> str:
@@ -672,6 +691,88 @@ async def handle_sentry_issue(
         raise McpError(f"An error occurred: {str(e)}")
 
 
+async def handle_get_event(
+    http_client: httpx.AsyncClient,
+    auth_token: str,
+    issue_id_or_url: str,
+    event_id: str
+) -> SentryEventData:
+    """
+    Retrieves a specific event from a Sentry issue.
+    
+    Args:
+        http_client: The HTTP client to use
+        auth_token: Sentry authentication token
+        issue_id_or_url: Either a full Sentry issue URL or just the issue ID
+        event_id: The specific event ID to retrieve
+        
+    Returns:
+        SentryEventData object containing the event information
+    """
+    try:
+        # First get the organization slug by listing organizations
+        orgs_response = await http_client.get(
+            "organizations/",
+            headers={"Authorization": f"Bearer {auth_token}"}
+        )
+        
+        if orgs_response.status_code == 401:
+            raise McpError("Error: Unauthorized. Please check your MCP_SENTRY_AUTH_TOKEN token.")
+            
+        orgs_response.raise_for_status()
+        orgs_data = orgs_response.json()
+        
+        if not orgs_data:
+            raise McpError("No organizations found for this auth token")
+            
+        org_slug = orgs_data[0]["slug"]  # Use first available org
+        
+        # Extract the issue ID
+        issue_id = extract_issue_id(issue_id_or_url)
+        
+        # Get the event data
+        response = await http_client.get(
+            f"organizations/{org_slug}/issues/{issue_id}/events/{event_id}/",
+            headers={"Authorization": f"Bearer {auth_token}"}
+        )
+        
+        if response.status_code == 401:
+            raise McpError("Error: Unauthorized. Please check your MCP_SENTRY_AUTH_TOKEN token.")
+        elif response.status_code == 404:
+            raise McpError("Event not found. It may have been deleted or you may not have permission to access it.")
+            
+        response.raise_for_status()
+        event_data = response.json()
+        
+        # Extract stacktrace if available
+        stacktrace = None
+        for entry in event_data.get("entries", []):
+            if entry["type"] == "exception":
+                stacktrace = create_stacktrace({"entries": [entry]})
+                break
+        
+        return SentryEventData(
+            event_id=event_data["eventID"],
+            issue_id=event_data["groupID"],
+            project_id=event_data["projectID"],
+            timestamp=event_data["dateCreated"],
+            title=event_data.get("title", ""),
+            message=event_data.get("message", ""),
+            level=event_data.get("level", "error"),
+            platform=event_data.get("platform", "unknown"),
+            stacktrace=stacktrace,
+            tags=event_data.get("tags", []),
+            contexts=event_data.get("contexts", {})
+        )
+        
+    except SentryError as e:
+        raise McpError(str(e))
+    except httpx.HTTPStatusError as e:
+        raise McpError(f"Error fetching Sentry event: {str(e)}")
+    except Exception as e:
+        raise McpError(f"An error occurred: {str(e)}")
+
+
 async def serve(auth_token: str) -> Server:
     server = Server("sentry")
     http_client = httpx.AsyncClient(base_url=SENTRY_API_BASE)
@@ -708,18 +809,15 @@ async def serve(auth_token: str) -> Server:
         return [
             types.Tool(
                 name="get_sentry_issue",
-                description="""Retrieve and analyze a Sentry issue by ID or URL. Use this tool when you need to:
-                - Investigate production errors and crashes
-                - Access detailed stacktraces from Sentry
-                - Analyze error patterns and frequencies
-                - Get information about when issues first/last occurred
-                - Review error counts and status""",
+                description="""Retrieve and analyze a Sentry issue. Accepts either:
+                1. A full Sentry issue URL (e.g., https://org-name.sentry.io/issues/123456)
+                2. Just the issue ID (e.g., 123456)""",
                 inputSchema={
                     "type": "object",
                     "properties": {
                         "issue_id_or_url": {
                             "type": "string",
-                            "description": "Sentry issue ID or URL to analyze"
+                            "description": "Either a full Sentry issue URL or just the numeric issue ID"
                         }
                     },
                     "required": ["issue_id_or_url"]
@@ -751,15 +849,9 @@ async def serve(auth_token: str) -> Server:
                             "items": {
                                 "type": "object",
                                 "properties": {
-                                    "repository": {
-                                        "type": "string"
-                                    },
-                                    "commit": {
-                                        "type": "string"
-                                    },
-                                    "previousCommit": {
-                                        "type": "string"
-                                    }
+                                    "repository": {"type": "string"},
+                                    "commit": {"type": "string"},
+                                    "previousCommit": {"type": "string"}
                                 }
                             },
                             "description": "Optional list of repository references"
@@ -770,58 +862,54 @@ async def serve(auth_token: str) -> Server:
             ),
             types.Tool(
                 name="get_replay",
-                description="""Retrieve and analyze a Sentry session replay. Use this tool when you need to:
-                - Access session replay metadata
-                - Link replays to related errors
-                - Analyze user activity during a session
-                - Get replay duration and timing information""",
+                description="""Retrieve and analyze a Sentry session replay. Accepts either:
+                1. A full Sentry replay URL (e.g., https://org-name.sentry.io/replays/abc123)
+                2. Organization slug and replay ID in format: 'org-slug:replay-id'""",
                 inputSchema={
                     "type": "object",
-                    "oneOf": [
-                        {
-                            "type": "object",
-                            "properties": {
-                                "url": {
-                                    "type": "string",
-                                    "description": "Full Sentry replay URL (e.g., https://buildwithcode.sentry.io/replays/{replay_id})"
-                                }
-                            },
-                            "required": ["url"]
-                        },
-                        {
-                            "type": "object",
-                            "properties": {
-                                "organization_slug": {
-                                    "type": "string",
-                                    "description": "Sentry organization slug (e.g., 'buildwithcode')"
-                                },
-                                "replay_id": {
-                                    "type": "string",
-                                    "description": "Sentry replay ID"
-                                }
-                            },
-                            "required": ["organization_slug", "replay_id"]
+                    "properties": {
+                        "replay_id_or_url": {
+                            "type": "string",
+                            "description": "Either a full Sentry replay URL or 'org-slug:replay-id' format"
                         }
-                    ]
+                    },
+                    "required": ["replay_id_or_url"]
                 }
             ),
             types.Tool(
                 name="get_trace",
-                description="""Retrieve and analyze a Sentry performance trace. Use this tool when you need to:
-                - Investigate transaction performance
-                - Analyze distributed tracing data
-                - View span operations and timings
-                - Check transaction status and tags
-                - Monitor end-to-end request flow""",
+                description="""Retrieve and analyze a Sentry performance trace. Accepts either:
+                1. A full Sentry trace URL (e.g., https://org-name.sentry.io/traces/trace/abc123)
+                2. Project ID and trace ID in format: 'project-id:trace-id'""",
                 inputSchema={
                     "type": "object",
                     "properties": {
                         "trace_id_or_url": {
                             "type": "string",
-                            "description": "Sentry trace ID (project_id:trace_id format) or performance URL"
+                            "description": "Either a full Sentry trace URL or 'project-id:trace-id' format"
                         }
                     },
                     "required": ["trace_id_or_url"]
+                }
+            ),
+            types.Tool(
+                name="get_sentry_event",
+                description="""Retrieve and analyze a specific Sentry event from an issue. Requires:
+                1. Issue ID or URL (e.g., https://org-name.sentry.io/issues/123456 or just 123456)
+                2. Event ID (e.g., ab29e1067f214acb8ce89f3a03be25e8)""",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "issue_id_or_url": {
+                            "type": "string",
+                            "description": "Either a full Sentry issue URL or just the numeric issue ID"
+                        },
+                        "event_id": {
+                            "type": "string",
+                            "description": "The specific event ID to retrieve"
+                        }
+                    },
+                    "required": ["issue_id_or_url", "event_id"]
                 }
             )
         ]
@@ -852,14 +940,10 @@ async def serve(auth_token: str) -> Server:
             return release_data.to_tool_result()
             
         elif name == "get_replay":
-            if "url" in arguments:
-                replay_data = await handle_get_replay(http_client, auth_token, arguments["url"])
-            elif "organization_slug" in arguments and "replay_id" in arguments:
-                # Construct the input format expected by handle_get_replay
-                replay_input = f"{arguments['organization_slug']}:{arguments['replay_id']}"
-                replay_data = await handle_get_replay(http_client, auth_token, replay_input)
+            if "replay_id_or_url" in arguments:
+                replay_data = await handle_get_replay(http_client, auth_token, arguments["replay_id_or_url"])
             else:
-                raise ValueError("Must provide either url or both organization_slug and replay_id")
+                raise ValueError("Missing replay_id_or_url argument")
             return replay_data.to_tool_result()
             
         elif name == "get_trace":
@@ -871,6 +955,17 @@ async def serve(auth_token: str) -> Server:
                 arguments["trace_id_or_url"]
             )
             return trace_data.to_tool_result()
+            
+        elif name == "get_sentry_event":
+            if "issue_id_or_url" not in arguments or "event_id" not in arguments:
+                raise ValueError("Missing required arguments: issue_id_or_url and event_id")
+            event_data = await handle_get_event(
+                http_client,
+                auth_token,
+                arguments["issue_id_or_url"],
+                arguments["event_id"]
+            )
+            return event_data.to_tool_result()
             
         raise ValueError(f"Unknown tool: {name}")
 

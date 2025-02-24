@@ -70,15 +70,46 @@ class SentryTraceData(BaseSentryData):
     status: str
     spans: list[dict]
     tags: dict
+    # New fields for better trace analysis
+    environment: str | None
+    release: str | None
+    user: dict | None
+    measurements: dict | None
+    transaction_op: str | None
+    sdk: dict | None
+    platform: str | None
+    contexts: dict | None
     
     def get_brief_summary(self) -> str:
+        user_info = "Anonymous"
+        if self.user:
+            user_info = f"{self.user.get('username', 'Unknown user')}"
+            if email := self.user.get('email'):
+                user_info += f" ({email})"
+
+        duration_ms = f"{self.duration:.2f}ms" if self.duration else "N/A"
+        env_info = f" in {self.environment}" if self.environment else ""
+        release_info = f" on {self.release}" if self.release else ""
+        
         summary = [
             f"🔍 Performance Trace: {self.transaction}",
-            f"Duration: {self.duration}ms ({self.status})",
+            f"Duration: {duration_ms} ({self.status}){env_info}{release_info}",
             f"Project: {self.project_id}",
+            f"User: {user_info}",
+            f"Platform: {self.platform or 'unknown'}",
+            f"Operation: {self.transaction_op or 'unknown'}",
             f"Spans: {len(self.spans)} operations tracked",
             f"Tags: {len(self.tags)} custom attributes"
         ]
+        
+        if self.measurements:
+            summary.append("\nKey Measurements:")
+            for key, value in self.measurements.items():
+                if isinstance(value, dict) and 'value' in value:
+                    summary.append(f"  • {key}: {value['value']}")
+                else:
+                    summary.append(f"  • {key}: {value}")
+                    
         return "\n".join(summary)
 
     def get_table_summary(self) -> str:
@@ -86,6 +117,10 @@ class SentryTraceData(BaseSentryData):
             "ID": self.trace_id,
             "Transaction": self.transaction,
             "Project": self.project_id,
+            "Environment": self.environment or "N/A",
+            "Release": self.release or "N/A",
+            "Platform": self.platform or "N/A",
+            "Operation": self.transaction_op or "N/A",
             "Timestamp": self.timestamp,
             "Duration": f"{self.duration}ms",
             "Status": self.status,
@@ -99,6 +134,10 @@ class SentryTraceData(BaseSentryData):
             "ID": self.trace_id,
             "Transaction": self.transaction,
             "Project": self.project_id,
+            "Environment": self.environment or "N/A",
+            "Release": self.release or "N/A",
+            "Platform": self.platform or "N/A",
+            "Operation": self.transaction_op or "N/A",
             "Timestamp": self.timestamp,
             "Duration": f"{self.duration}ms",
             "Status": self.status
@@ -107,14 +146,42 @@ class SentryTraceData(BaseSentryData):
         result = self._format_dict_to_markdown_table(basic_info, "Sentry Performance Trace")
         
         if view == ViewType.DETAILED:
+            if self.user:
+                result += "\n" + self._format_dict_to_markdown_table(self.user, "User Information")
+                
+            if self.measurements:
+                measurements_info = {}
+                for key, value in self.measurements.items():
+                    if isinstance(value, dict) and 'value' in value:
+                        measurements_info[key] = str(value['value'])
+                    else:
+                        measurements_info[key] = str(value)
+                result += "\n" + self._format_dict_to_markdown_table(measurements_info, "Measurements")
+            
             if self.spans:
                 result += "\n### Spans\n\n"
-                result += "| Operation | Description | Duration |\n|------------|-------------|----------|\n"
+                result += "| Operation | Description | Duration | Status | Tags |\n"
+                result += "|------------|-------------|----------|---------|------|\n"
                 for span in self.spans:
-                    result += f"| {span.get('op', 'unknown')} | {span.get('description', 'N/A')} | {span.get('duration', 0)}ms |\n"
+                    tags = ", ".join(f"{k}={v}" for k, v in span.get('tags', {}).items())
+                    result += (
+                        f"| {span.get('op', 'unknown')} "
+                        f"| {span.get('description', 'N/A')} "
+                        f"| {span.get('duration', 0)}ms "
+                        f"| {span.get('status', 'unknown')} "
+                        f"| {tags or 'N/A'} |\n"
+                    )
             
             if self.tags:
                 result += "\n" + self._format_dict_to_markdown_table(self.tags, "Tags")
+                
+            if self.contexts:
+                for context_name, context_data in self.contexts.items():
+                    if isinstance(context_data, dict):
+                        result += f"\n" + self._format_dict_to_markdown_table(
+                            {k: str(v) for k, v in context_data.items()},
+                            f"{context_name.title()} Context"
+                        )
                 
         return result
     
@@ -123,6 +190,10 @@ class SentryTraceData(BaseSentryData):
             "ID": self.trace_id,
             "Transaction": self.transaction,
             "Project": self.project_id,
+            "Environment": self.environment or "N/A",
+            "Release": self.release or "N/A",
+            "Platform": self.platform or "N/A",
+            "Operation": self.transaction_op or "N/A",
             "Timestamp": self.timestamp,
             "Duration": f"{self.duration}ms",
             "Status": self.status
@@ -131,13 +202,41 @@ class SentryTraceData(BaseSentryData):
         result = self._format_dict_to_text(basic_info, "Sentry Performance Trace")
         
         if view == ViewType.DETAILED:
+            if self.user:
+                result += "\n" + self._format_dict_to_text(self.user, "User Information")
+                
+            if self.measurements:
+                measurements_info = {}
+                for key, value in self.measurements.items():
+                    if isinstance(value, dict) and 'value' in value:
+                        measurements_info[key] = str(value['value'])
+                    else:
+                        measurements_info[key] = str(value)
+                result += "\n" + self._format_dict_to_text(measurements_info, "Measurements")
+            
             if self.spans:
                 result += "\nSpans:\n"
                 for span in self.spans:
-                    result += f"  - {span.get('op', 'unknown')}: {span.get('description', 'N/A')} ({span.get('duration', 0)}ms)\n"
+                    tags = ", ".join(f"{k}={v}" for k, v in span.get('tags', {}).items())
+                    result += (
+                        f"  - {span.get('op', 'unknown')}: "
+                        f"{span.get('description', 'N/A')} "
+                        f"({span.get('duration', 0)}ms, {span.get('status', 'unknown')})"
+                    )
+                    if tags:
+                        result += f"\n    Tags: {tags}"
+                    result += "\n"
             
             if self.tags:
                 result += "\n" + self._format_dict_to_text(self.tags, "Tags")
+                
+            if self.contexts:
+                for context_name, context_data in self.contexts.items():
+                    if isinstance(context_data, dict):
+                        result += f"\n" + self._format_dict_to_text(
+                            {k: str(v) for k, v in context_data.items()},
+                            f"{context_name.title()} Context"
+                        )
                 
         return result
 
@@ -1004,7 +1103,7 @@ def parse_sentry_url(url: str, expected_type: PathType) -> ParsedSentryUrl:
     Parses and validates a Sentry URL.
     
     Args:
-        url: Full Sentry URL (e.g., https://org-name.sentry.io/issues/123456)
+        url: Full Sentry URL (e.g., https://org-name.sentry.io/traces/trace/123456)
         expected_type: Expected URL type ('issues', 'replays', or 'traces')
         
     Returns:
@@ -1027,6 +1126,7 @@ def parse_sentry_url(url: str, expected_type: PathType) -> ParsedSentryUrl:
         if not parsed.netloc or not parsed.netloc.endswith(f".{SENTRY_DOMAIN}"):
             raise SentryError(f"Invalid Sentry URL. Must end with .{SENTRY_DOMAIN}")
         
+        # Extract org slug from hostname, preserving any hyphens
         org_slug = parsed.netloc.split('.')[0]
         logger.debug(f"Extracted org_slug: {org_slug}")
         if not org_slug:
@@ -1048,11 +1148,11 @@ def parse_sentry_url(url: str, expected_type: PathType) -> ParsedSentryUrl:
         if url_type == SentryUrlType.TRACES:
             if len(path_parts) < 3 or path_parts[0] != "traces" or path_parts[1] != "trace":
                 raise SentryError("Invalid traces URL format. Expected: /traces/trace/{id}")
-            item_id = path_parts[2]
+            item_id = path_parts[2].split('?')[0]  # Remove query parameters
         else:
             if len(path_parts) < 2 or path_parts[0] != url_type:
                 raise SentryError(f"Invalid {url_type} URL format. Expected: /{url_type}/{{id}}")
-            item_id = path_parts[1].split('?')[0]  # Remove any query parameters
+            item_id = path_parts[1].split('?')[0]  # Remove query parameters
             
         logger.debug(f"Extracted item_id: {item_id}")
         
@@ -1145,59 +1245,35 @@ def extract_replay_id(replay_id_or_url: str) -> tuple[str, str]:
         return org_slug, replay_id
 
 
-def extract_trace_id(trace_id_or_url: str) -> tuple[str, str, str]:
+def extract_trace_id(trace_id_or_url: str) -> tuple[str, str]:
     """
-    Extracts the Sentry trace ID, project ID, and organization slug from either a full URL or standalone IDs.
+    Extracts the Sentry trace ID and organization slug from either a full URL or standalone IDs.
     
     Args:
-        trace_id_or_url: Either a full Sentry trace URL or "org_slug:project_id:trace_id" format
+        trace_id_or_url: Either a full Sentry trace URL or "org_slug:trace_id" format
         
     Returns:
-        Tuple of (org_slug, project_id, trace_id)
+        Tuple of (org_slug, trace_id)
     """
     if not trace_id_or_url:
         raise SentryError("Missing trace_id_or_url argument")
 
     if trace_id_or_url.startswith(("http://", "https://")):
-        parsed_url = urlparse(trace_id_or_url)
-        if not parsed_url.hostname or not parsed_url.hostname.endswith(".sentry.io"):
-            raise SentryError("Invalid Sentry URL. Must be a URL ending with .sentry.io")
-
-        # Extract organization slug from hostname, preserving hyphens
-        org_slug = parsed_url.hostname.split('.')[0]
-        if not org_slug:
-            raise SentryError("Missing organization slug in hostname")
-
-        # Extract trace ID from path
-        path_parts = parsed_url.path.strip("/").split("/")
-        if len(path_parts) < 2 or path_parts[0] != "performance":
-            raise SentryError(
-                "Invalid Sentry trace URL. Path must contain '/performance/{trace_id}'"
-            )
-        trace_id = path_parts[1].rstrip("/")
-
-        # Parse query parameters
-        from urllib.parse import parse_qs
-        query_params = parse_qs(parsed_url.query)
-        
-        # Get project ID from query parameters
-        project_id = query_params.get('project', [None])[0]
-        if not project_id:
-            raise SentryError("Missing project ID in trace URL query parameters")
-
+        parsed = parse_sentry_url(trace_id_or_url, "traces")
+        return parsed.org_slug, parsed.item_id
     else:
-        # Expect format: org_slug:project_id:trace_id
+        # Expect format: org_slug:trace_id
         try:
-            parts = trace_id_or_url.split(":")
-            if len(parts) != 3:
-                raise ValueError("Expected format: org_slug:project_id:trace_id")
-            org_slug, project_id, trace_id = parts
+            org_slug, trace_id = trace_id_or_url.split(":")
+            if not _is_valid_org_slug(org_slug):
+                raise SentryError(f"Invalid organization slug format: {org_slug}")
+            if not _is_valid_item_id(trace_id, SentryUrlType.TRACES):
+                raise SentryError(f"Invalid trace ID format: {trace_id}")
+            return org_slug, trace_id
         except ValueError:
             raise SentryError(
-                "Invalid trace ID format. Must be either a URL or 'org_slug:project_id:trace_id'"
+                "Invalid trace ID format. Must be either a URL or 'org_slug:trace_id'"
             )
-
-    return org_slug, project_id, trace_id
 
 
 def create_stacktrace(latest_event: dict) -> str:
@@ -1260,21 +1336,27 @@ async def handle_get_trace(
     Args:
         http_client: The HTTP client to use
         auth_token: Sentry authentication token
-        trace_id_or_url: Either a full Sentry trace URL or "org_slug:project_id:trace_id" format
+        trace_id_or_url: Either a full Sentry trace URL or "org_slug:trace_id" format
         
     Returns:
         SentryTraceData object containing the trace information
     """
     try:
-        org_slug, project_id, trace_id = extract_trace_id(trace_id_or_url)
-        logger.debug(f"[Trace] Using organization slug: {org_slug} for trace ID: {trace_id} and project ID: {project_id}")
+        org_slug, trace_id = extract_trace_id(trace_id_or_url)
+        logger.debug(f"[Trace] Using organization slug: {org_slug} for trace ID: {trace_id}")
+        
+        # Construct API URL
+        api_url = f"organizations/{org_slug}/events/{trace_id}/"
+        logger.debug(f"[Trace] Making request to: {SENTRY_API_BASE}{api_url}")
         
         # Use the correct API endpoint format for traces with required fields
         response = await http_client.get(
-            f"organizations/{org_slug}/events/{trace_id}/",
-            headers={"Authorization": f"Bearer {auth_token}"},
+            api_url,
+            headers={
+                "Authorization": f"Bearer {auth_token}",
+                "Content-Type": "application/json",
+            },
             params={
-                "project": project_id,
                 "type": "transaction",
                 "field": [
                     "transaction",
@@ -1285,21 +1367,37 @@ async def handle_get_trace(
                     "contexts",
                     "trace",
                     "duration",
-                    "status"
+                    "status",
+                    "project_id",
+                    "environment",
+                    "release",
+                    "user",
+                    "measurements",
+                    "transaction.op",
+                    "sdk",
+                    "platform"
                 ]
             }
         )
         
+        # Log full response details
+        log_response(response, "[Trace]")
+        
         if response.status_code == 401:
+            logger.error("[Trace] Authentication failed with 401 status code")
             raise McpError("Error: Unauthorized. Please check your MCP_SENTRY_AUTH_TOKEN token.")
         elif response.status_code == 404:
+            logger.error("[Trace] Resource not found with 404 status code")
             raise McpError("Trace not found. It may have been deleted or you may not have permission to access it.")
             
         response.raise_for_status()
         trace_data = response.json()
         
         if not trace_data:
+            logger.error("[Trace] Received empty response from Sentry API")
             raise McpError("Received empty response from Sentry API")
+            
+        logger.debug(f"[Trace] Successfully parsed trace data with keys: {list(trace_data.keys())}")
             
         # Calculate duration from start_timestamp and timestamp if available
         duration = 0
@@ -1313,22 +1411,38 @@ async def handle_get_trace(
         else:
             duration = trace_data.get("duration", 0)
         
-        return SentryTraceData(
+        # Create SentryTraceData object with all available information
+        trace_obj = SentryTraceData(
             trace_id=trace_id,
             transaction=trace_data.get("transaction", ""),
-            project_id=project_id,
+            project_id=str(trace_data.get("project_id", "")),
             timestamp=trace_data.get("timestamp", ""),
             duration=duration,
             status=trace_data.get("status", "unknown"),
             spans=trace_data.get("spans", []),
-            tags=trace_data.get("tags", {})
+            tags=trace_data.get("tags", {}),
+            # New fields
+            environment=trace_data.get("environment"),
+            release=trace_data.get("release"),
+            user=trace_data.get("user"),
+            measurements=trace_data.get("measurements"),
+            transaction_op=trace_data.get("transaction.op"),
+            sdk=trace_data.get("sdk"),
+            platform=trace_data.get("platform"),
+            contexts=trace_data.get("contexts", {})
         )
         
+        logger.debug("[Trace] Successfully created SentryTraceData object")
+        return trace_obj
+        
     except SentryError as e:
+        logger.error(f"[Trace] SentryError occurred: {str(e)}")
         raise McpError(str(e))
     except httpx.HTTPStatusError as e:
+        logger.error(f"[Trace] HTTP error occurred: {str(e)}")
         raise McpError(f"Error fetching Sentry trace: {str(e)}")
     except Exception as e:
+        logger.error(f"[Trace] Unexpected error occurred: {str(e)}")
         raise McpError(f"An error occurred: {str(e)}")
 
 

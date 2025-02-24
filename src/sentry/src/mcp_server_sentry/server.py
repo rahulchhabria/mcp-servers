@@ -417,9 +417,9 @@ async def handle_get_replay(
             
         org_slug = orgs_data[0]["slug"]  # Use first available org
         
-        # Use the correct API endpoint format for session replays
+        # Use the correct API endpoint format for replays
         response = await http_client.get(
-            f"organizations/{org_slug}/sessions/{replay_id}/",
+            f"organizations/{org_slug}/replays/{replay_id}/",
             headers={"Authorization": f"Bearer {auth_token}"},
             params={
                 "project": project_id,
